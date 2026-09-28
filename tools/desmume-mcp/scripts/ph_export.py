@@ -494,6 +494,8 @@ def main():
     ap.add_argument("--dest-repo", default=REPO,
                     help="git checkout to commit to (default: this desmume checkout)")
     ap.add_argument("--force", action="store_true", help="export even if verification fails")
+    ap.add_argument("--partial", action="store_true",
+                    help="export only the modules that match the decomp (e.g. for another revision of the game)")
     ap.add_argument("--no-encrypt", action="store_true", help="only allowed when the repo is confirmed private")
     args = ap.parse_args()
 
@@ -538,13 +540,29 @@ def main():
     total_ok = sum(s["ok"] for s in stats.values())
     total_bad = sum(s["bad"] for s in stats.values())
     rate = total_ok / max(1, total_ok + total_bad)
+    def module_ok(s):
+        return s["ok"] > 0 and s["ok"] / (s["ok"] + s["bad"]) >= 0.98
+
     for name, s in stats.items():
         if s["bad"] > max(3, 0.02 * (s["ok"] + s["bad"])):
             log(f"  {name}: {s['ok']} ok, {s['bad']} mismatched, e.g. {s['samples'][:2]}")
     log(f"  {total_ok}/{total_ok + total_bad} calls match ({100 * rate:.2f}%)")
-    if rate < 0.98 and not args.force:
+    skipped_modules = []
+    if args.partial:
+        # a different revision usually changes only some modules: keep the
+        # ones whose code still matches the decomp exactly
+        skipped_modules = sorted(n for n, s in stats.items() if not module_ok(s))
+        for n in skipped_modules:
+            del modules[n]
+        log(f"  --partial: exporting {len(modules)} modules that match, skipping {len(skipped_modules)}: "
+            + (", ".join(skipped_modules) or "none"))
+        if not modules:
+            sys.exit("no module matches the decomp; nothing to export")
+    elif rate < 0.98 and not args.force:
+        good = sum(1 for s in stats.values() if module_ok(s))
         sys.exit("verification failed: this ROM does not match the decomp's addresses (wrong region/revision?). "
-                 "Nothing was written. --force to export anyway.")
+                 f"Nothing was written. {good} of {len(stats)} modules do match: --partial exports just those, "
+                 "--force exports everything anyway.")
 
     exp = Exporter(modules)
     log("building the call graph ...")
@@ -556,7 +574,8 @@ def main():
     meta = {"game": game, "game_title": GAMES[game]["title"],
             "created": datetime.datetime.now().isoformat(timespec="seconds"), "rom_sha1": sha1,
             "rom_matches_decomp_reference": exact, "game_code": rom.game_code, "version": version,
-            "decomp_commit": ph_rev, "verification": {"calls_ok": total_ok, "calls_bad": total_bad,
+            "decomp_commit": ph_rev, "skipped_modules": skipped_modules,
+            "verification": {"calls_ok": total_ok, "calls_bad": total_bad,
                                                   "per_module": {k: {"ok": v["ok"], "bad": v["bad"]}
                                                                  for k, v in stats.items()}}}
     log(f"disassembling into {out_dir} ...")
