@@ -632,6 +632,24 @@ putpacket ( SOCKET_TYPE sock, struct debug_out_packet *out_packet, uint32_t size
 
 
 
+static void
+free_breakpoint_list_gdb( struct gdb_stub_state *stub, struct breakpoint_gdb **bpoint_list) {
+  while ( *bpoint_list != NULL) {
+    struct breakpoint_gdb *bpoint = *bpoint_list;
+    *bpoint_list = bpoint->next;
+    bpoint->next = stub->free_breakpoints;
+    stub->free_breakpoints = bpoint;
+  }
+}
+
+static void
+free_all_breakpoints_gdb( struct gdb_stub_state *stub) {
+  free_breakpoint_list_gdb( stub, &stub->instr_breakpoints);
+  free_breakpoint_list_gdb( stub, &stub->read_breakpoints);
+  free_breakpoint_list_gdb( stub, &stub->write_breakpoints);
+  free_breakpoint_list_gdb( stub, &stub->access_breakpoints);
+}
+
 static uint32_t
 make_stop_packet( uint8_t *ptr, enum stop_type type, uint32_t stop_address) {
   uint32_t stop_size = 0;
@@ -664,8 +682,8 @@ make_stop_packet( uint8_t *ptr, enum stop_type type, uint32_t stop_address) {
       int i;
       int out_index = 0;
       ptr[out_index++] = 'T';
-      ptr[out_index++] = hexchars[TARGET_SIGNAL_ABRT >> 4];
-      ptr[out_index++] = hexchars[TARGET_SIGNAL_ABRT & 0xf];
+      ptr[out_index++] = hexchars[TARGET_SIGNAL_TRAP >> 4];
+      ptr[out_index++] = hexchars[TARGET_SIGNAL_TRAP & 0xf];
 
       if ( watch_index < 2) {
         ptr[out_index++] = watch_chars[watch_index];
@@ -678,7 +696,7 @@ make_stop_packet( uint8_t *ptr, enum stop_type type, uint32_t stop_address) {
       ptr[out_index++] = ':';
 
       for ( i = 0; i < 8; i++) {
-        ptr[out_index++] = hexchars[(stop_address >> (i * 4)) & 0xf];
+        ptr[out_index++] = hexchars[(stop_address >> ((7 - i) * 4)) & 0xf];
       }
       ptr[out_index++] = ';';
 
@@ -735,6 +753,26 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
 	NDS_debug_continue();
 	infopipe_send(stub, 1);
     break;
+
+  case 'D':
+    /* Detach: drop all breakpoints and watchpoints, let the emulation run
+     * freely and close the connection so that gdb can reattach later. */
+    free_all_breakpoints_gdb( stub);
+
+    stub->emu_stub_state = gdb_stub_state::RUNNING_EMU_GDB_STATE;
+    stub->ctl_stub_state = gdb_stub_state::START_RUN_GDB_STATE;
+    stub->main_stop_flag = 0;
+    stub->cpu_ctrl->remove_post_ex_fn( stub->cpu_ctrl->data);
+    stub->cpu_ctrl->unstall( stub->cpu_ctrl->data);
+    NDS_debug_continue();
+
+    strcpy( (char *)out_ptr, "OK");
+    gdbstub_mutex_unlock();
+    putpacket( sock, out_packet, 2);
+    infopipe_send(stub, 1);
+
+    /* returning -1 makes the caller close the socket */
+    return -1;
 
   case 's': {
     uint32_t instr_addr = stub->cpu_ctrl->read_reg( stub->cpu_ctrl->data, 15);
@@ -1213,7 +1251,15 @@ WINAPI listenerThread_gdb( void *data) {
 	switch ( ctl_command) {
 
 	case CPU_STOPPED_STUB_MESSAGE:
-	  if ( state->active &&
+	  if ( state->active && state->silent_stop &&
+		  state->ctl_stub_state != gdb_stub_state::STOPPED_GDB_STATE) {
+	    /* halted because gdb connected while the CPU was running, gdb
+	     * will find out about the stop with the '?' query */
+	    state->silent_stop = 0;
+	    state->ctl_stub_state = gdb_stub_state::STOPPED_GDB_STATE;
+	    state->main_stop_flag = 1;
+	  }
+	  else if ( state->active &&
 		  state->ctl_stub_state != gdb_stub_state::STOPPED_GDB_STATE) {
 	    struct debug_out_packet *out_packet = getOutPacket();
 	    uint8_t *ptr = out_packet->start_ptr;
@@ -1280,6 +1326,16 @@ WINAPI listenerThread_gdb( void *data) {
 
               FD_SET( new_conn, &main_set);
               state->sock_fd = new_conn;
+
+              /* gdb expects the target to be halted when it connects (packets
+               * are refused while running), so stop the CPU if it is running,
+               * e.g. after a previous session detached */
+              if ( state->ctl_stub_state != gdb_stub_state::STOPPED_GDB_STATE) {
+                state->silent_stop = 1;
+                state->cpu_ctrl->install_post_ex_fn( state->cpu_ctrl->data,
+                                                     break_execution,
+                                                     state);
+              }
             }
 
             if ( close_sock) {
@@ -1589,6 +1645,7 @@ createStub_gdb( uint16_t port,
     stub->listen_fd = createSocket( port);
 
     stub->stop_type = STOP_UNKNOWN;
+    stub->silent_stop = 0;
 
     if ( stub->listen_fd == -1) {
       LOG_ERROR( "Failed to create listening socket \"%s\"\n", strerror( errno));

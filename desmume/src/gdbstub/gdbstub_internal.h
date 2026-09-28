@@ -162,6 +162,11 @@ struct gdb_stub_state {
   /** the address of the stop */
   uint32_t stop_address;
 
+  /** set when the CPU is being halted because gdb has just connected; the
+   * resulting stop is reported through the '?' query instead of an
+   * unsolicited stop packet */
+  int silent_stop;
+
   /** The step break point decsriptor */
   struct breakpoint_gdb step_breakpoint_descr;
 
