@@ -561,7 +561,8 @@ def main():
         to_push = enc
 
     if args.push:
-        branch = subprocess.run(["git", "-C", dest_repo, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True,
+        # symbolic-ref also works on a fresh clone of an empty repository
+        branch = subprocess.run(["git", "-C", dest_repo, "symbolic-ref", "--short", "HEAD"], capture_output=True,
                                 text=True, check=True).stdout.strip()
         dest_dir = os.path.join(dest_repo, "labelling")
         os.makedirs(dest_dir, exist_ok=True)
