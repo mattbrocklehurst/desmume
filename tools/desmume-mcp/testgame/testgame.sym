@@ -1,0 +1,13 @@
+02000000 T _start
+0200002c T fill_rect
+020000c0 T apply_damage
+020000d0 T handle_input
+0200015c T draw
+02000234 T game_main
+020002e0 t __apply_damage_from_arm
+020002f0 d old_x
+020002f4 d old_y
+020002f8 D g_player
+02000310 B __bss_start
+02000310 B g_last_keys
+02000314 B __bss_end

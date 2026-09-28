@@ -167,6 +167,31 @@ struct gdb_stub_state {
    * unsolicited stop packet */
   int silent_stop;
 
+  /** a stop has been signalled and not yet resumed; further breakpoint and
+   * watchpoint hits are ignored until then */
+  int stop_pending;
+
+  /** a watchpoint was hit during the current instruction; the CPU is stopped
+   * once that instruction has completed */
+  int watch_pending;
+  enum stop_type watch_type;
+  uint32_t watch_address;
+  uint32_t watch_insn;
+
+  /** address of the instruction that made the access for watchpoint stops */
+  uint32_t stop_insn_address;
+
+  /** the connected client announced itself with qSupported (i.e. it is gdb) */
+  int client_is_gdb;
+
+  /** gdb assumes ARM watchpoints trigger before the access and then steps
+   * over the accessing instruction (a software single step: a breakpoint on
+   * the next instruction plus continue). The stub stops after the access, so
+   * for gdb clients it reports pc as the accessing instruction and answers
+   * the following resume with an immediate stop, leaving the CPU exactly
+   * after the access. */
+  int swallow_step;
+
   /** The step break point decsriptor */
   struct breakpoint_gdb step_breakpoint_descr;
 

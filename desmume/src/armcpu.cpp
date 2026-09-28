@@ -116,10 +116,25 @@ set_cpu_reg( void *instance, u32 reg_num, u32 value) {
     armcpu->R[reg_num] = value;
   }
   else if ( reg_num == 15) {
-    armcpu->next_instruction = value;
+    /* refetch so that execution resumes at the new address, the instruction
+     * at the old address has already been prefetched */
+    armcpu->next_instruction = value & (armcpu->CPSR.bits.T ? ~1U : ~3U);
+    armcpu_prefetch(armcpu);
   }
   else if ( reg_num == 16) {
-    /* FIXME: setting the CPSR */
+    const u32 old_thumb = armcpu->CPSR.bits.T;
+
+    if ( (value & 0x1F) != armcpu->CPSR.bits.mode) {
+      armcpu_switchMode( armcpu, value & 0x1F);
+    }
+    armcpu->CPSR.val = value;
+    armcpu_changeCPSR();
+
+    if ( armcpu->CPSR.bits.T != old_thumb) {
+      /* the pending instruction was fetched for the other instruction set */
+      armcpu->next_instruction = armcpu->instruct_adr & (armcpu->CPSR.bits.T ? ~1U : ~3U);
+      armcpu_prefetch(armcpu);
+    }
   }
 }
 

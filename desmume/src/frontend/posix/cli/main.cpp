@@ -47,6 +47,8 @@
 #include "../commandline.h"
 #include "../slot2.h"
 #include "../utils/xstring.h"
+#include "../movie.h"
+#include "control_server.h"
 
 #ifdef GDB_STUB
 #include "../armcpu.h"
@@ -60,7 +62,11 @@ public:
 		SPU_Pause(1);
 	}
 	virtual void EMU_DebugIdleUpdate() {
-		gdbstub_wait(__stubs, -1L);
+		/* wake up regularly so the window and the control port stay
+		 * responsive while gdb has the CPUs halted */
+		gdbstub_wait(__stubs, 20);
+		SDL_PumpEvents();
+		ctl_poll(0, true);
 	}
 	virtual void EMU_DebugIdleWakeUp() {
 		SPU_Pause(0);
@@ -235,6 +241,11 @@ fill_config( class configured_features *config,
   }
 #endif
 
+  if (config->control_port < 0 || config->control_port > 65535) {
+    g_printerr("Control port must be in the range 1 to 65535\n");
+    goto error;
+  }
+
   return 1;
 
 error:
@@ -298,7 +309,7 @@ static void Draw(class configured_features *cfg) {
 	return;
 }
 
-static void desmume_cycle(struct ctrls_event_config * cfg)
+static void process_events(struct ctrls_event_config * cfg)
 {
     SDL_Event event;
 
@@ -313,8 +324,23 @@ static void desmume_cycle(struct ctrls_event_config * cfg)
     while ( !cfg->sdl_quit &&
         (SDL_PollEvent(&event) || (!cfg->focused && SDL_WaitEvent(&event))))
       {
+        if (event.type == SDL_KEYDOWN && !event.key.repeat &&
+            event.key.keysym.sym == SDLK_F11) {
+          ctl_toggle_pause();
+          continue;
+        }
+        if (event.type == SDL_KEYDOWN && !event.key.repeat &&
+            event.key.keysym.sym == SDLK_F12) {
+          ctl_hotkey_dump();
+          continue;
+        }
         process_ctrls_event( event, cfg);
     }
+}
+
+static void desmume_cycle(struct ctrls_event_config * cfg)
+{
+    process_events(cfg);
 
     /* Update mouse position and click */
     if(mouse.down) {
@@ -327,7 +353,13 @@ static void desmume_cycle(struct ctrls_event_config * cfg)
         mouse.click = 0;
       }
 
-    update_keypad(cfg->keypad);     /* Update keypad */
+    update_keypad(ctl_pre_frame(cfg->keypad));     /* Update keypad */
+
+    NDS_beginProcessingInput();
+    FCEUMOV_HandlePlayback();
+    NDS_endProcessingInput();
+    FCEUMOV_HandleRecording();
+
     NDS_exec<false>();
     SPU_Emulate_user();
 }
@@ -432,6 +464,14 @@ int main(int argc, char ** argv) {
     slot2_Change((NDS_SLOT2_TYPE)slot2_device_type);
 
   driver = new CliDriver();
+
+  if (my_config.control_port > 0) {
+    if (!ctl_init(my_config.control_port)) {
+      fprintf(stderr, "Failed to listen for control commands on port %d\n", my_config.control_port);
+      exit(1);
+    }
+    fprintf(stderr, "Control interface listening on 127.0.0.1:%d\n", my_config.control_port);
+  }
 
 #ifdef GDB_STUB
   gdbstub_mutex_init();
@@ -555,6 +595,18 @@ int main(int argc, char ** argv) {
   ctrls_cfg.resize_cb = &resizeWindow_stub;
 
   while(!ctrls_cfg.sdl_quit) {
+    ctl_poll(0, false);
+    if (ctl_quit_requested())
+      break;
+
+    if (ctl_is_paused()) {
+      /* keep the window alive and wait for control commands */
+      process_events(&ctrls_cfg);
+      Draw(&my_config);
+      ctl_poll(15, false);
+      continue;
+    }
+
     desmume_cycle(&ctrls_cfg);
 
 #ifdef HAVE_LIBAGG
@@ -563,14 +615,16 @@ int main(int argc, char ** argv) {
 #endif
 
     Draw(&my_config);
+    ctl_frame_done();
 
 #ifdef HAVE_LIBAGG
     osd->clear();
 #endif
 
-    for ( int i = 0; i < my_config.frameskip; i++ ) {
+    for ( int i = 0; i < my_config.frameskip && !ctl_is_paused(); i++ ) {
         NDS_SkipNextFrame();
         desmume_cycle(&ctrls_cfg);
+        ctl_frame_done();
     }
 
 #ifdef DISPLAY_FPS
@@ -609,6 +663,8 @@ int main(int argc, char ** argv) {
     }
 #endif
   }
+
+  ctl_shutdown();
 
   /* Unload joystick */
   uninit_joy();

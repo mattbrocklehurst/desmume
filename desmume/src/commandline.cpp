@@ -132,6 +132,10 @@ ENDL
 " --arm7gdb PORTNUM          Enable the ARM7 GDB stub on the given port" ENDL
 ENDL
 #endif
+"Arguments affecting automation:" ENDL
+" --control-port PORTNUM     Listen for control commands on 127.0.0.1:PORTNUM" ENDL
+"                            (desmume-cli only, see tools/desmume-mcp)" ENDL
+ENDL
 "Utility commands which occur in place of emulation:" ENDL
 " --advanscene-import PATH   Import advanscene, dump .ddb, and exit" ENDL
 ENDL
@@ -174,6 +178,7 @@ ENDL
 
 #define OPT_ARM9GDB 700
 #define OPT_ARM7GDB 701
+#define OPT_CONTROL_PORT 702
 
 #define OPT_RTC_DAY 800
 #define OPT_RTC_HOUR 801
@@ -226,6 +231,7 @@ CommandLine::CommandLine()
 	record_movie_file         = "";
 	arm9_gdb_port             = 0;
 	arm7_gdb_port             = 0;
+	control_port              = 0;
 	start_paused              = 0;
 	cflash_image              = "";
 	cflash_path               = "";
@@ -333,6 +339,7 @@ bool CommandLine::parse(int argc,char **argv)
 				{ "arm9gdb", required_argument, NULL, OPT_ARM9GDB},
 				{ "arm7gdb", required_argument, NULL, OPT_ARM7GDB},
 			#endif
+			{ "control-port", required_argument, NULL, OPT_CONTROL_PORT},
 
 			//utilities
 			{ "advanscene-import", required_argument, NULL, OPT_ADVANSCENE},
@@ -397,6 +404,7 @@ bool CommandLine::parse(int argc,char **argv)
 		//debugging
 		case OPT_ARM9GDB: arm9_gdb_port = atoi(optarg); break;
 		case OPT_ARM7GDB: arm7_gdb_port = atoi(optarg); break;
+		case OPT_CONTROL_PORT: control_port = atoi(optarg); break;
 
 		//utilities
 		case OPT_ADVANSCENE: CommonSettings.run_advanscene_import = optarg; break;

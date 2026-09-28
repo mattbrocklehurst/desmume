@@ -4,6 +4,7 @@ cli_dependencies = dependencies + [dep_x11]
 
 cli_src = [
   'main.cpp',
+  'control_server.cpp',
   '../shared/sndsdl.cpp',
   '../shared/ctrlssdl.cpp',
 ]

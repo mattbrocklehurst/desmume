@@ -85,6 +85,7 @@ public:
 	std::string record_movie_file;
 	int arm9_gdb_port;
 	int arm7_gdb_port;
+	int control_port;
 	int start_paused;
 	std::string cflash_image;
 	std::string cflash_path;

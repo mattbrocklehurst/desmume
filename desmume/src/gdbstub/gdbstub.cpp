@@ -345,6 +345,26 @@ static void infopipe_send(struct gdb_stub_state* g, int status) {
  *
  */
 static void
+watch_stop_after_insn( void *data, UNUSED_PARM(uint32_t addr), UNUSED_PARM(int thumb)) {
+  struct gdb_stub_state *stub = (struct gdb_stub_state *)data;
+
+  /* the instruction that accessed the watched memory has now completed,
+   * stop before the next one executes */
+  stub->cpu_ctrl->stall( stub->cpu_ctrl->data);
+  stub->cpu_ctrl->remove_post_ex_fn( stub->cpu_ctrl->data);
+
+  stub->watch_pending = 0;
+  stub->stop_pending = 1;
+  stub->swallow_step = stub->client_is_gdb;
+  stub->stop_type = stub->watch_type;
+  stub->stop_address = stub->watch_address;
+  stub->stop_insn_address = stub->watch_insn;
+  indicateCPUStop_gdb( stub);
+
+  NDS_debug_break();
+}
+
+static void
 break_execution( void *data, UNUSED_PARM(uint32_t addr), UNUSED_PARM(int thunmb)) {
   struct gdb_stub_state *stub = (struct gdb_stub_state *)data;
 
@@ -356,6 +376,7 @@ break_execution( void *data, UNUSED_PARM(uint32_t addr), UNUSED_PARM(int thunmb)
   stub->cpu_ctrl->remove_post_ex_fn( stub->cpu_ctrl->data);
 
   /* indicate the halt */
+  stub->stop_pending = 1;
   stub->stop_type = STOP_HOST_BREAK;
   indicateCPUStop_gdb( stub);
 }
@@ -377,6 +398,7 @@ step_instruction_watch( void *data, uint32_t addr, UNUSED_PARM(int thunmb)) {
     stub->cpu_ctrl->remove_post_ex_fn( stub->cpu_ctrl->data);
 
     /* indicate the halt */
+    stub->stop_pending = 1;
     stub->stop_type = STOP_STEP_BREAK;
     indicateCPUStop_gdb( stub);
 
@@ -651,7 +673,8 @@ free_all_breakpoints_gdb( struct gdb_stub_state *stub) {
 }
 
 static uint32_t
-make_stop_packet( uint8_t *ptr, enum stop_type type, uint32_t stop_address) {
+make_stop_packet( uint8_t *ptr, enum stop_type type, uint32_t stop_address,
+                  uint32_t insn_address) {
   uint32_t stop_size = 0;
   int watch_index = 0;
   const char watch_chars[] = { 'a', 'r' };
@@ -700,6 +723,15 @@ make_stop_packet( uint8_t *ptr, enum stop_type type, uint32_t stop_address) {
       }
       ptr[out_index++] = ';';
 
+      /* non-standard: the address of the instruction that made the access
+       * (gdb ignores stop reply fields it does not know) */
+      memcpy( &ptr[out_index], "insn:", 5);
+      out_index += 5;
+      for ( i = 0; i < 8; i++) {
+        ptr[out_index++] = hexchars[(insn_address >> ((7 - i) * 4)) & 0xf];
+      }
+      ptr[out_index++] = ';';
+
       stop_size = out_index;
     }
     break;
@@ -723,6 +755,16 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
   DEBUG_LOG("Processing packet %c\n", packet[0]);
   gdbstub_mutex_lock();
 
+  if ( stub->swallow_step && (packet[0] == 'c' || packet[0] == 's')) {
+    /* gdb stepping over the instruction that hit a watchpoint, which has
+     * already executed: report the step as done without running */
+    stub->swallow_step = 0;
+    stub->stop_type = STOP_STEP_BREAK;
+    send_size = make_stop_packet( out_ptr, STOP_STEP_BREAK, 0, 0);
+    gdbstub_mutex_unlock();
+    return putpacket( sock, out_packet, send_size);
+  }
+
   switch( packet[0]) {
   case 3:
     /* The break command */
@@ -735,7 +777,8 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
     break;
 
   case '?':
-    send_size = make_stop_packet( out_ptr, stub->stop_type, stub->stop_address);
+    send_size = make_stop_packet( out_ptr, stub->stop_type, stub->stop_address,
+                                 stub->stop_insn_address);
     /**ptr++ = 'S';
     *ptr++ = hexchars[stub->stop_reason >> 4];
     *ptr++ = hexchars[stub->stop_reason & 0xf];
@@ -747,11 +790,21 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
 	stub->emu_stub_state = gdb_stub_state::RUNNING_EMU_GDB_STATE;
     stub->ctl_stub_state = gdb_stub_state::START_RUN_GDB_STATE;
     stub->main_stop_flag = 0;
+    stub->stop_pending = 0;
+    stub->watch_pending = 0;
     send_reply = 0;
     /* remove the cpu stall */
     stub->cpu_ctrl->unstall( stub->cpu_ctrl->data);
 	NDS_debug_continue();
 	infopipe_send(stub, 1);
+    break;
+
+  case 'q':
+    /* no query packets are supported, but qSupported tells us that the
+     * client is gdb (see swallow_step) */
+    if ( strncmp( (const char *)packet, "qSupported", 10) == 0) {
+      stub->client_is_gdb = 1;
+    }
     break;
 
   case 'D':
@@ -762,6 +815,8 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
     stub->emu_stub_state = gdb_stub_state::RUNNING_EMU_GDB_STATE;
     stub->ctl_stub_state = gdb_stub_state::START_RUN_GDB_STATE;
     stub->main_stop_flag = 0;
+    stub->stop_pending = 0;
+    stub->watch_pending = 0;
     stub->cpu_ctrl->remove_post_ex_fn( stub->cpu_ctrl->data);
     stub->cpu_ctrl->unstall( stub->cpu_ctrl->data);
     NDS_debug_continue();
@@ -776,6 +831,7 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
 
   case 's': {
     uint32_t instr_addr = stub->cpu_ctrl->read_reg( stub->cpu_ctrl->data, 15);
+
     /* Determine where the next instruction will take the CPU.
      * Execute the instruction using a copy of the CPU with a zero memory interface.
      */
@@ -790,6 +846,8 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
     stub->emu_stub_state = gdb_stub_state::RUNNING_EMU_GDB_STATE;
     stub->ctl_stub_state = gdb_stub_state::START_RUN_GDB_STATE;
     stub->main_stop_flag = 0;
+    stub->stop_pending = 0;
+    stub->watch_pending = 0;
     send_reply = 0;
 
     /* remove the cpu stall */
@@ -804,6 +862,7 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
      * Register set
      */
   case 'P': {
+    stub->swallow_step = 0;
     uint32_t reg;
     uint32_t value;
     const uint8_t *rx_ptr = &packet[1];
@@ -1024,6 +1083,7 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
      */
   case 'G':
     {
+    stub->swallow_step = 0;
       int i;
       const uint8_t *rx_ptr = &packet[1];
       uint32_t reg_values[16];
@@ -1058,6 +1118,10 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
       int i;
       int out_index = 0;
       uint32_t pc_value = stub->cpu_ctrl->read_reg( stub->cpu_ctrl->data, 15);
+
+      /* see swallow_step: gdb expects to be stopped on the accessing instruction */
+      if ( stub->swallow_step)
+        pc_value = stub->stop_insn_address;
       uint32_t cpsr_value = stub->cpu_ctrl->read_reg( stub->cpu_ctrl->data, 16);
 
       DEBUG_LOG("'g' command PC = %08x\n", pc_value);
@@ -1189,16 +1253,41 @@ INLINE static int
 check_breaks_gdb( struct gdb_stub_state *gdb_state,
                   struct breakpoint_gdb *bpoint_list,
                   uint32_t addr,
-                  UNUSED_PARM(uint32_t size),
+                  uint32_t size,
                   enum stop_type stop_type) {
   int found_break = 0;
 
-  if ( gdb_state->active) {
+  if ( gdb_state->active && !gdb_state->stop_pending && !gdb_state->watch_pending) {
     struct breakpoint_gdb *bpoint = bpoint_list;
 
     while ( bpoint != NULL && !found_break) {
-      if ( addr == bpoint->addr) {
+      int hit;
+
+      if ( stop_type == STOP_BREAKPOINT) {
+        hit = addr == bpoint->addr;
+      }
+      else {
+        /* watchpoints trigger on any access overlapping the watched range */
+        uint32_t watch_size = bpoint->size ? bpoint->size : 1;
+        hit = addr < bpoint->addr + watch_size && bpoint->addr < addr + size;
+      }
+
+      if ( hit && stop_type != STOP_BREAKPOINT) {
+        /* the access happens in the middle of an instruction: remember it
+         * and stop as soon as the instruction has completed */
+        found_break = 1;
+        gdb_state->watch_pending = 1;
+        gdb_state->watch_type = stop_type;
+        gdb_state->watch_address = bpoint->addr;
+        gdb_state->watch_insn = gdb_state->cpu_ctrl->read_reg( gdb_state->cpu_ctrl->data, 15);
+        gdb_state->cpu_ctrl->install_post_ex_fn( gdb_state->cpu_ctrl->data,
+                                                 watch_stop_after_insn,
+                                                 gdb_state);
+      }
+      else if ( hit) {
         DEBUG_LOG("Breakpoint hit at %08x\n", addr);
+        found_break = 1;
+        gdb_state->stop_pending = 1;
 
         /* stall the processor */
         gdb_state->cpu_ctrl->stall( gdb_state->cpu_ctrl->data);
@@ -1207,7 +1296,8 @@ check_breaks_gdb( struct gdb_stub_state *gdb_state,
 
         /* indicate the break to the GDB stub thread */
         gdb_state->stop_type = stop_type;
-        gdb_state->stop_address = addr;
+        /* report the watched address so that gdb can match it */
+        gdb_state->stop_address = bpoint->addr;
         indicateCPUStop_gdb( gdb_state);
       }
       bpoint = bpoint->next;
@@ -1269,7 +1359,8 @@ WINAPI listenerThread_gdb( void *data) {
 			state->ctl_stub_state = gdb_stub_state::STOPPED_GDB_STATE;
 	    state->main_stop_flag = 1;
 
-            send_size = make_stop_packet( ptr, state->stop_type, state->stop_address);
+            send_size = make_stop_packet( ptr, state->stop_type, state->stop_address,
+                                         state->stop_insn_address);
 
 	    /*ptr[0] = 'S';
 	    ptr[1] = hexchars[state->stop_reason >> 4];
@@ -1326,6 +1417,8 @@ WINAPI listenerThread_gdb( void *data) {
 
               FD_SET( new_conn, &main_set);
               state->sock_fd = new_conn;
+              state->client_is_gdb = 0;
+              state->swallow_step = 0;
 
               /* gdb expects the target to be halted when it connects (packets
                * are refused while running), so stop the CPU if it is running,
@@ -1646,6 +1739,11 @@ createStub_gdb( uint16_t port,
 
     stub->stop_type = STOP_UNKNOWN;
     stub->silent_stop = 0;
+    stub->stop_pending = 0;
+    stub->watch_pending = 0;
+    stub->stop_insn_address = 0;
+    stub->client_is_gdb = 0;
+    stub->swallow_step = 0;
 
     if ( stub->listen_fd == -1) {
       LOG_ERROR( "Failed to create listening socket \"%s\"\n", strerror( errno));
