@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 testgame/*.elf
 testgame/*.bin
+testgame/tests/*.png
+testgame/tests/*.json
+*.egg-info/

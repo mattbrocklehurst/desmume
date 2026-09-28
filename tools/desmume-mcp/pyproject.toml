@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "desmume-mcp"
+version = "0.1.0"
+description = "MCP server, debugger toolkit and oracle test runner for the DeSmuME Nintendo DS emulator"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-2.0-or-later" }
+dependencies = ["mcp>=1.2", "capstone>=5"]
+
+[project.scripts]
+desmume-mcp = "desmume_mcp.server:main"
+desmume-oracle = "desmume_mcp.oracle:main"
+
+[tool.setuptools]
+packages = ["desmume_mcp"]

@@ -42,17 +42,34 @@ $ gdb-multiarch
 (gdb) detach                          # clears breakpoints, game keeps running
 ```
 
-Supported: register read/write (`g`/`G`/`P`), memory read/write (`m`/`M`),
-continue, single step, Ctrl-C break-in, instruction breakpoints (`Z0`/`Z1`),
+Supported: register read/write (`g`/`G`/`P`, including pc and cpsr), memory
+read/write (`m`/`M`), continue, single step, Ctrl-C break-in (also while the
+emulator is paused between frames), instruction breakpoints (`Z0`/`Z1`),
 write/read/access watchpoints (`Z2`/`Z3`/`Z4`), detach (`D`), and reattaching
 to a running game (the CPU is halted when gdb connects).
 
 Notes:
 
-* No symbols are available, so use `break *ADDR`, `x/i`, and `display/i $pc`.
-* Watchpoints stop a few instructions after the access, not exactly on it.
+* No symbols are available, so use `break *ADDR`, `x/i`, and `display/i $pc`
+  (or the MCP tools in `tools/desmume-mcp`, which keep a label database).
+* Watchpoints trigger on any access overlapping the watched range and stop
+  exactly after the accessing instruction. The stop reply carries a
+  non-standard `insn:ADDR;` field with that instruction's address (gdb
+  ignores it). For gdb itself the stub follows gdb's ARM watchpoint model,
+  so gdb shows the old/new value with pc on the next instruction.
 * Breakpoints are checked on instruction fetch, so they work in any memory
   region, including code copied to RAM or ITCM at runtime.
+* desmume-cli's event hooks (`--control-port`, `hook_set ... action=break`)
+  stop the CPU through the stub with a `T05hook:<event>;` stop reply, e.g.
+  when the game reads a given file from the card.
+
+## Automation
+
+`desmume-cli --control-port PORT` adds a line based control interface
+(pause, frame stepping, input, memory, screenshots, savestates, event hooks,
+tracepoints, profiling), and `--headless` runs without a window or X server.
+`tools/desmume-mcp` builds an MCP server for AI agents and an oracle test
+runner on top of both; see its README and `docs/PROTOCOL.md`.
 
 ## Scripted / non-interactive use
 

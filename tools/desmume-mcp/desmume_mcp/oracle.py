@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import struct
 import sys
 import tempfile
@@ -482,6 +483,11 @@ def cmd_run(args):
 
 def cmd_record(args):
     """Play in a window; the input is recorded until the window is closed."""
+    # finish on Ctrl-C or SIGTERM; a flag, so a control request is never cut
+    # in half (and background launches, which ignore SIGINT, can use TERM)
+    stop = []
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.append(True))
     s = Session(args.rom, headless=False, debugger=False, jit=args.jit, deterministic=True,
                 extra_args=["--start-paused"])
     s.start()
@@ -494,11 +500,9 @@ def cmd_record(args):
               f"or press Ctrl-C here to finish.", file=sys.stderr)
         alive = True
         try:
-            while s.alive():
+            while s.alive() and not stop:
                 time.sleep(0.2)
                 rec.poll()
-        except KeyboardInterrupt:
-            pass
         except (ControlError, OSError):
             alive = False
         alive = alive and s.alive()

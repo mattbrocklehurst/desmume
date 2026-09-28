@@ -115,9 +115,11 @@ def parse_int(v):
 def emu_start(rom_path: str, headless: bool | None = None, debug_arm7: bool = False,
               start_halted: bool = False, sound: bool | None = None, extra_args: list[str] | None = None):
     """Launch desmume-cli with a ROM, the control port and the ARM9 gdb stub,
-    and attach the debugger. headless=None picks automatically (a window if a
-    display is available, else xvfb). start_halted=True leaves the CPU stopped
-    at the entry point. debug_arm7 also attaches to the ARM7."""
+    and attach the debugger. headless=None picks automatically: a window if a
+    display is available, else headless (no X server needed; runs without a
+    frame limiter). start_halted=True leaves the CPU stopped at the entry
+    point. debug_arm7 also attaches to the ARM7. Runs are deterministic
+    (fixed RTC and seeds)."""
     global S, SCAN
     if S is not None:
         S.stop()
