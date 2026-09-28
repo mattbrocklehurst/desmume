@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Export an annotated disassembly of Zelda: Phantom Hourglass for labelling.
+"""Export an annotated disassembly of a zeldaret DS decomp's game for labelling:
+The Legend of Zelda: Phantom Hourglass (--game ph, default) or Spirit Tracks
+(--game st).
 
-Takes your own ROM dump and the zeldaret/ph decompilation's symbol tables
+Takes your own ROM dump and the decompilation's (zeldaret/ph or zeldaret/st) symbol tables
 (config/<version>/arm9) and writes, for every function of the main binary,
 ITCM and all overlays: its code with calls, pointers and literal pool values
 resolved to symbol names, I/O register names and referenced strings, plus
@@ -70,28 +72,39 @@ def log(msg):
 # inputs
 
 
-def get_ph(path):
+GAMES = {
+    "ph": {"title": "Phantom Hourglass", "url": "https://github.com/zeldaret/ph",
+           "codes": {"AZEE": "usa", "AZEP": "eur"}},
+    "st": {"title": "Spirit Tracks", "url": "https://github.com/zeldaret/st",
+           "codes": {"BKIE": "usa", "BKIP": "eur", "BKIJ": "jp"}},
+}
+
+
+def get_decomp(path, game):
     if path:
         return os.path.abspath(path)
-    cache = os.path.expanduser("~/.cache/desmume-mcp/ph")
+    cache = os.path.expanduser(f"~/.cache/desmume-mcp/{game}")
     if not os.path.isdir(os.path.join(cache, "config")):
-        log(f"cloning zeldaret/ph into {cache} ...")
+        log(f"cloning {GAMES[game]['url']} into {cache} ...")
         os.makedirs(os.path.dirname(cache), exist_ok=True)
-        subprocess.run(["git", "clone", "-q", "--depth", "1", "https://github.com/zeldaret/ph", cache], check=True)
+        subprocess.run(["git", "clone", "-q", "--depth", "1", GAMES[game]["url"], cache], check=True)
     else:
         subprocess.run(["git", "-C", cache, "pull", "-q", "--ff-only"], check=False)
     return cache
 
 
-def detect_version(ph, rom_bytes, rom, forced):
+def detect_version(decomp, game, rom_bytes, rom, forced):
+    """Version from the decomp's <game>_<version>.sha1 files (each may list
+    several accepted dumps), else from the game code."""
     sha1 = hashlib.sha1(rom_bytes).hexdigest()
     known = {}
-    for v in ("usa", "eur"):
-        p = os.path.join(ph, f"ph_{v}.sha1")
-        if os.path.exists(p):
-            known[open(p).read().split()[0].lower()] = v
-    by_code = {"AZEE": "usa", "AZEP": "eur"}
-    version = forced or known.get(sha1) or by_code.get(rom.game_code)
+    for name in sorted(os.listdir(decomp)):
+        m = re.match(rf"^{game}_(\w+)\.sha1$", name)
+        if m:
+            for line in open(os.path.join(decomp, name)):
+                if line.split():
+                    known[line.split()[0].lower()] = m.group(1)
+    version = forced or known.get(sha1) or GAMES[game]["codes"].get(rom.game_code)
     return version, sha1, sha1 in known
 
 
@@ -444,9 +457,9 @@ def write_export(out_dir, exp, modules, meta):
     with open(os.path.join(out_dir, "summary.json"), "w") as fh:
         json.dump(meta, fh, indent=1)
     with open(os.path.join(out_dir, "README.txt"), "w") as fh:
-        fh.write("Phantom Hourglass export for labelling (see tools/desmume-mcp/scripts/ph_export.py).\n"
+        fh.write(f"{meta['game_title']} export for labelling (see tools/desmume-mcp/scripts/ph_export.py).\n"
                  "asm/<module>.s: every function, with calls, pointers, literal values and strings resolved\n"
-                 "against the zeldaret/ph symbols; index.tsv: all symbols with caller/callee counts\n"
+                 "against the decomp's symbols; index.tsv: all symbols with caller/callee counts\n"
                  "(for data: the first 16 bytes); summary.json: versions and the verification results.\n")
 
 
@@ -472,9 +485,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("rom")
-    ap.add_argument("--ph", help="path to a zeldaret/ph checkout (default: clone into ~/.cache)")
-    ap.add_argument("--version", choices=["usa", "eur"])
-    ap.add_argument("--out", default=None, help="output directory (default: ./ph-export-<version>)")
+    ap.add_argument("--game", choices=sorted(GAMES), default="ph", help="ph (default) or st")
+    ap.add_argument("--decomp", "--ph", dest="decomp",
+                    help="path to the zeldaret/<game> checkout (default: clone into ~/.cache)")
+    ap.add_argument("--version", help="usa, eur, eur1, jp... (default: detected from the ROM)")
+    ap.add_argument("--out", default=None, help="output directory (default: ./<game>-export-<version>)")
     ap.add_argument("--push", action="store_true", help="commit the encrypted export to a repo's current branch and push")
     ap.add_argument("--dest-repo", default=REPO,
                     help="git checkout to commit to (default: this desmume checkout)")
@@ -495,10 +510,12 @@ def main():
 
     rom_bytes = open(args.rom, "rb").read()
     rom = Rom(args.rom)
-    ph = get_ph(args.ph)
-    version, sha1, exact = detect_version(ph, rom_bytes, rom, args.version)
+    game = args.game
+    ph = get_decomp(args.decomp, game)
+    version, sha1, exact = detect_version(ph, game, rom_bytes, rom, args.version)
     if not version:
-        sys.exit(f"cannot tell the ROM version (game code {rom.game_code}); pass --version usa|eur")
+        sys.exit(f"cannot tell the ROM version (game code {rom.game_code}); pass --version "
+                 f"(one of {', '.join(sorted(os.listdir(os.path.join(ph, 'config'))))}), or check --game")
     log(f"ROM {rom.title} [{rom.game_code}] sha1 {sha1}: {version}"
         + ("" if exact else " (sha1 does not match the decomp's reference dump; verifying against the code)"))
     cfg = os.path.join(ph, "config", version, "arm9")
@@ -532,13 +549,14 @@ def main():
     exp = Exporter(modules)
     log("building the call graph ...")
     exp.build_call_graph()
-    out_dir = os.path.abspath(args.out or f"ph-export-{version}")
+    out_dir = os.path.abspath(args.out or f"{game}-export-{version}")
     if os.path.exists(out_dir):
         shutil.rmtree(out_dir)
     ph_rev = subprocess.run(["git", "-C", ph, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-    meta = {"created": datetime.datetime.now().isoformat(timespec="seconds"), "rom_sha1": sha1,
+    meta = {"game": game, "game_title": GAMES[game]["title"],
+            "created": datetime.datetime.now().isoformat(timespec="seconds"), "rom_sha1": sha1,
             "rom_matches_decomp_reference": exact, "game_code": rom.game_code, "version": version,
-            "ph_commit": ph_rev, "verification": {"calls_ok": total_ok, "calls_bad": total_bad,
+            "decomp_commit": ph_rev, "verification": {"calls_ok": total_ok, "calls_bad": total_bad,
                                                   "per_module": {k: {"ok": v["ok"], "bad": v["bad"]}
                                                                  for k, v in stats.items()}}}
     log(f"disassembling into {out_dir} ...")
@@ -575,12 +593,12 @@ def main():
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, os.path.basename(to_push))
         shutil.copyfile(to_push, dest)
-        with open(os.path.join(dest_dir, f"ph-export-{version}.json"), "w") as fh:
+        with open(os.path.join(dest_dir, f"{game}-export-{version}.json"), "w") as fh:
             json.dump({k: v for k, v in meta.items() if k != "rom_sha1"} | {"file": os.path.basename(dest),
                        "encrypted": passphrase is not None}, fh, indent=1)
         subprocess.run(["git", "-C", dest_repo, "add", "labelling"], check=True)
         subprocess.run(["git", "-C", dest_repo, "commit", "-q", "-m",
-                        f"labelling: {'encrypted ' if passphrase else ''}PH {version} export for naming functions"],
+                        f"labelling: {'encrypted ' if passphrase else ''}{game.upper()} {version} export for naming functions"],
                        check=True)
         subprocess.run(["git", "-C", dest_repo, "push", "-q", "origin", branch], check=True)
         log(f"pushed {os.path.relpath(dest, dest_repo)} to {branch} in {dest_repo}")
