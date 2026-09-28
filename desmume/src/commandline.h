@@ -97,6 +97,9 @@ public:
 	int _slot1_no8000prot;
 	int disable_sound;
 	int disable_limiter;
+	int headless;
+	int rtc_fixed;
+	int deterministic;
 	int windowed_fullscreen;
 	int frameskip;
 	int horizontal;

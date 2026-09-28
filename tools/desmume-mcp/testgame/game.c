@@ -9,7 +9,11 @@
  *    pressed;
  *  - a 2D tilemap (from the level file) that build_display_list() turns into
  *    3D quads in a RAM display list, which is DMA'd to the geometry engine
- *    through the GX FIFO every frame, followed by SWAP_BUFFERS.
+ *    through the GX FIFO every frame, followed by SWAP_BUFFERS;
+ *  - an arena allocator and opaque asset files (assets/a.dat .. d.dat) loaded
+ *    into allocated buffers from different places: a.dat at boot, b.dat and
+ *    c.dat when the level is (re)loaded with START, d.dat when A is first
+ *    pressed. Reloading frees b.dat's buffer but leaks c.dat's (on purpose).
  *
  * The symbols are in testgame.sym (ground truth for the tests).
  */
@@ -35,6 +39,10 @@ typedef volatile u8 vu8; typedef volatile u16 vu16; typedef volatile u32 vu32;
 #define RGB(r,g,b)     (0x8000 | (r) | ((g)<<5) | ((b)<<10))
 
 #define FILE_LEVEL1    4       /* data/level1.map, see mkrom.py */
+#define FILE_A_DAT     5       /* assets/a.dat .. d.dat */
+#define FILE_B_DAT     6
+#define FILE_C_DAT     7
+#define FILE_D_DAT     8
 #define MAP_W          4
 #define MAP_H          4
 
@@ -82,25 +90,108 @@ __attribute__((noinline)) void card_read_block(u32 rom_addr, u32 *dst) {
     }
 }
 
-/* look the file up in the FAT and load it (small files only). Like real
- * games, the FAT location comes from the copy of the ROM header that the
- * BIOS leaves in RAM: retail cards refuse data reads below 0x8000. */
-__attribute__((noinline)) u32 fs_read_file(u32 file_id, void *dst, u32 max_len) {
+/* look a file up in the FAT. Like real games, the FAT location comes from
+ * the copy of the ROM header that the BIOS leaves in RAM: retail cards
+ * refuse data reads below 0x8000. */
+__attribute__((noinline)) void fs_file_extent(u32 file_id, u32 *start, u32 *end) {
     u32 fat_off = *(vu32 *)(0x027FFE00 + 0x48);
     u32 entry = fat_off + file_id * 8;
     card_read_block(entry & ~0x1FF, g_card_buf);
-    u32 start = g_card_buf[(entry & 0x1FF) / 4];
-    u32 end = g_card_buf[(entry & 0x1FF) / 4 + 1];
+    *start = g_card_buf[(entry & 0x1FF) / 4];
+    *end = g_card_buf[(entry & 0x1FF) / 4 + 1];
+}
+
+/* load a file, block by block, through the card buffer */
+__attribute__((noinline)) u32 fs_read_file(u32 file_id, void *dst, u32 max_len) {
+    u32 start, end;
+    fs_file_extent(file_id, &start, &end);
     u32 len = end - start;
     if (len > max_len) len = max_len;
-    card_read_block(start & ~0x1FF, g_card_buf);
-    const u8 *src = (const u8 *)g_card_buf + (start & 0x1FF);
-    for (u32 i = 0; i < len; i++) ((u8 *)dst)[i] = src[i];
+    u32 done = 0;
+    while (done < len) {
+        u32 pos = start + done;
+        card_read_block(pos & ~0x1FF, g_card_buf);
+        u32 off = pos & 0x1FF;
+        u32 n = 0x200 - off;
+        if (n > len - done) n = len - done;
+        for (u32 i = 0; i < n; i++) ((u8 *)dst)[done + i] = ((const u8 *)g_card_buf)[off + i];
+        done += n;
+    }
     return len;
+}
+
+/* ----------------------------------------------------------- memory --- */
+
+struct block { u32 size; u32 tag; struct block *next; u32 magic; };
+struct arena { u8 *base; u32 size; u32 top; struct block *free_list; u32 in_use; u32 peak; };
+
+u8 g_heap[64 * 1024];
+struct arena g_arena = { g_heap, sizeof(g_heap), 0, 0, 0, 0 };
+
+/* first fit from the free list, else bump allocate; the block header sits
+ * just before the returned pointer */
+__attribute__((noinline)) void *arena_alloc(struct arena *a, u32 size, u32 tag) {
+    size = (size + 15) & ~15;
+    struct block **pp = &a->free_list;
+    struct block *b = *pp;
+    while (b && b->size < size) { pp = &b->next; b = *pp; }
+    if (b) {
+        *pp = b->next;
+    } else {
+        if (a->top + sizeof(struct block) + size > a->size) return 0;
+        b = (struct block *)(a->base + a->top);
+        a->top += sizeof(struct block) + size;
+        b->size = size;
+    }
+    b->tag = tag;
+    b->magic = 0xA110CA7E;
+    b->next = 0;
+    a->in_use += b->size;
+    if (a->in_use > a->peak) a->peak = a->in_use;
+    return b + 1;
+}
+
+__attribute__((noinline)) void arena_free(struct arena *a, void *p) {
+    if (!p) return;
+    struct block *b = (struct block *)p - 1;
+    b->magic = 0xDEADF4EE;
+    a->in_use -= b->size;
+    b->next = a->free_list;
+    a->free_list = b;
+}
+
+/* ----------------------------------------------------------- assets --- */
+
+struct asset { void *data; u32 size; };
+struct asset g_ui_asset, g_level_asset, g_level_extra, g_sfx_asset;
+
+__attribute__((noinline)) void asset_load(struct asset *out, u32 file_id, u32 tag) {
+    u32 start, end;
+    fs_file_extent(file_id, &start, &end);
+    out->size = end - start;
+    out->data = arena_alloc(&g_arena, out->size, tag);
+    if (out->data) fs_read_file(file_id, out->data, out->size);
+}
+
+__attribute__((noinline)) void asset_unload(struct asset *a) {
+    arena_free(&g_arena, a->data);
+    a->data = 0;
+}
+
+__attribute__((noinline)) void load_level_assets(void) {
+    if (g_level_asset.data) asset_unload(&g_level_asset);
+    /* bug on purpose: g_level_extra is not unloaded before being replaced */
+    asset_load(&g_level_asset, FILE_B_DAT, 'LVL0');
+    asset_load(&g_level_extra, FILE_C_DAT, 'LVL1');
+}
+
+__attribute__((noinline)) void play_sfx(void) {
+    if (!g_sfx_asset.data) asset_load(&g_sfx_asset, FILE_D_DAT, 'SFX0');
 }
 
 __attribute__((noinline)) void load_level(void) {
     fs_read_file(FILE_LEVEL1, g_tilemap, sizeof(g_tilemap));
+    load_level_assets();
     g_levels_loaded++;
 }
 
@@ -160,6 +251,7 @@ __attribute__((noinline)) void handle_input(struct player *p, u32 keys) {
     if ((keys & 1) && !(g_last_keys & 1)) {   /* A pressed: take damage */
         apply_damage(p, 7);
         p->score += 10;
+        play_sfx();
     }
     if ((keys & 8) && !(g_last_keys & 8))     /* START: reload the level */
         load_level();
@@ -191,6 +283,7 @@ void game_main(void) {
     REG_VRAMCNT_A = 0x80;          /* bank A enabled, LCDC */
     REG_DISPCNT = 0x00020000;      /* display mode 2: framebuffer from bank A */
     fill_rect(0, 0, 256, 192, RGB(2, 2, 8));
+    asset_load(&g_ui_asset, FILE_A_DAT, 'UI00');
     load_level();
     for (;;) {
         wait_vblank();

@@ -34,6 +34,9 @@ enum DebugHookEvent
 	DEBUG_HOOK_DMA,			// DMA copy started: a = channel | startmode << 8, b = source, c = destination, d = byte count
 	DEBUG_HOOK_GX,			// geometry command queued for the 3D engine: a = command id, b = parameter
 	DEBUG_HOOK_SWAP,		// SWAP_BUFFERS executed (a 3D frame is complete): a = parameter
+	DEBUG_HOOK_EXEC,		// a traced address is about to execute (see debug_exec_trace_set): a = address
+	DEBUG_HOOK_INPUT,		// a CPU read KEYINPUT/EXTKEYIN: a = register address, b = value (active low)
+	DEBUG_HOOK_TOUCH,		// the ARM7 sampled the touch screen: a = TSC channel, b = ADC value, c = touching, d = x | y << 16
 	DEBUG_HOOK_COUNT
 };
 
@@ -55,6 +58,42 @@ extern DebugHookHandler debug_hook_handler;
 extern u32 debug_hook_dma_source;
 
 void debug_hook_dispatch(DebugHookEvent event, int cpu, u32 a, u32 b, u32 c, u32 d);
+
+// Execution tracing: addresses marked here raise DEBUG_HOOK_EXEC just before
+// the instruction executes (checked on instruction fetch by the gdb stub's
+// memory interface, so a stub must be active for that CPU). Main RAM uses a
+// bitmap; a few other addresses (ITCM, WRAM) go in a small list.
+void debug_exec_trace_set(u32 addr, bool on);
+void debug_exec_trace_clear();
+bool debug_exec_trace_other(u32 addr);
+extern u8 debug_exec_bitmap[0x400000 / 16];
+extern int debug_exec_other_count;
+
+static inline bool debug_exec_traced(u32 addr)
+{
+	if ((addr & 0xFFC00000) == 0x02000000)
+	{
+		const u32 i = (addr & 0x3FFFFF) >> 1;
+		return (debug_exec_bitmap[i >> 3] >> (i & 7)) & 1;
+	}
+	return debug_exec_other_count && debug_exec_trace_other(addr);
+}
+
+// Sampling profiler: every debug_profile_interval instructions (0 = off) the
+// handler receives the address of the instruction about to execute.
+typedef void (*DebugProfileHandler)(int cpu, u32 pc);
+extern u32 debug_profile_interval;
+extern u32 debug_profile_countdown[2];
+extern DebugProfileHandler debug_profile_handler;
+
+static inline void debug_profile_tick(int cpu, u32 pc)
+{
+	if (debug_profile_interval && --debug_profile_countdown[cpu] == 0)
+	{
+		debug_profile_countdown[cpu] = debug_profile_interval;
+		if (debug_profile_handler) debug_profile_handler(cpu, pc);
+	}
+}
 
 static inline void debug_hook(DebugHookEvent event, int cpu, u32 a, u32 b = 0, u32 c = 0, u32 d = 0)
 {

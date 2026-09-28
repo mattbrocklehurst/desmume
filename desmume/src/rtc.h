@@ -25,6 +25,8 @@
 #include "utils/datetime.h"
 
 extern int rtcHourOverride;
+// derive the clock from the emulated frame count instead of the host clock
+extern bool rtcFixedClock;
 
 DateTime rtcGetTime(void);
 void rtcGetTimeAsString(char *buffer);

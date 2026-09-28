@@ -30,6 +30,7 @@
 #include "movie.h"
 
 int rtcHourOverride = 0;
+bool rtcFixedClock = false;
 
 typedef struct
 {
@@ -96,7 +97,7 @@ bool moviemode=false;
 
 DateTime rtcGetTime(void)
 {
-	if(movieMode == MOVIEMODE_INACTIVE) {
+	if(movieMode == MOVIEMODE_INACTIVE && !rtcFixedClock) {
 		return DateTime::get_Now().AddHours(rtcHourOverride);
 	}
 	else {
@@ -110,7 +111,8 @@ DateTime rtcGetTime(void)
 		u64 totalcycles = (u64)arm9rate_unitsperframe * currFrameCounter;
 		u64 totalseconds=totalcycles/arm9rate_unitspersecond;
 
-		DateTime timer = currMovieData.rtcStart;
+		//with a fixed clock (for reproducible runs) time starts at 2000-01-01 00:00:00
+		DateTime timer = (movieMode == MOVIEMODE_INACTIVE) ? DateTime(2000,1,1,0,0,0) : currMovieData.rtcStart;
 		return timer.AddSeconds(totalseconds);
 	}
 }

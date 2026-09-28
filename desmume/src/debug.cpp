@@ -501,3 +501,47 @@ void debug_hook_dispatch(DebugHookEvent event, int cpu, u32 a, u32 b, u32 c, u32
 	info.dma_source = debug_hook_dma_source;
 	debug_hook_handler(info);
 }
+
+u8 debug_exec_bitmap[0x400000 / 16];
+int debug_exec_other_count = 0;
+static u32 debug_exec_other[64];
+
+void debug_exec_trace_set(u32 addr, bool on)
+{
+	addr &= ~1;
+	if ((addr & 0xFFC00000) == 0x02000000)
+	{
+		const u32 i = (addr & 0x3FFFFF) >> 1;
+		if (on) debug_exec_bitmap[i >> 3] |= 1 << (i & 7);
+		else debug_exec_bitmap[i >> 3] &= ~(1 << (i & 7));
+		return;
+	}
+	for (int k = 0; k < debug_exec_other_count; k++)
+	{
+		if (debug_exec_other[k] == addr)
+		{
+			if (!on) debug_exec_other[k] = debug_exec_other[--debug_exec_other_count];
+			return;
+		}
+	}
+	if (on && debug_exec_other_count < 64)
+		debug_exec_other[debug_exec_other_count++] = addr;
+}
+
+void debug_exec_trace_clear()
+{
+	memset(debug_exec_bitmap, 0, sizeof(debug_exec_bitmap));
+	debug_exec_other_count = 0;
+}
+
+bool debug_exec_trace_other(u32 addr)
+{
+	addr &= ~1;
+	for (int k = 0; k < debug_exec_other_count; k++)
+		if (debug_exec_other[k] == addr) return true;
+	return false;
+}
+
+u32 debug_profile_interval = 0;
+u32 debug_profile_countdown[2] = { 1, 1 };
+DebugProfileHandler debug_profile_handler = NULL;

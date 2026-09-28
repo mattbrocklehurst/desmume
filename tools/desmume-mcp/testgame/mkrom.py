@@ -11,6 +11,7 @@ usage: mkrom.py arm9.bin overlay0.bin out.nds
 """
 
 import os
+import random
 import struct
 import sys
 
@@ -29,6 +30,11 @@ LEVEL1_MAP = bytes([
     1, 3, 0, 1,
     1, 1, 1, 1,
 ])
+
+# opaque asset files of different sizes (the game identifies them by file
+# id only; ids 5-8 must match FILE_*_DAT in game.c)
+ASSET_NAMES = ["a.dat", "b.dat", "c.dat", "d.dat"]
+ASSETS = [random.Random(1234 + i).randbytes(size) for i, size in enumerate((300, 1500, 700, 96))]
 
 # ARM7: just spin (b .)
 ARM7_CODE = struct.pack("<I", 0xEAFFFFFE)
@@ -97,8 +103,9 @@ def main():
         b"DeSmuME MCP test game\n",                      # id 2: readme.txt
         b"hello from the data directory\n",              # id 3: data/hello.txt
         LEVEL1_MAP,                                      # id 4: data/level1.map
-    ]
-    fnt = build_fnt([("readme.txt", 2)], [("data", [("hello.txt", 3), ("level1.map", 4)])])
+    ] + ASSETS                                           # id 5-8: assets/a.dat .. d.dat
+    fnt = build_fnt([("readme.txt", 2)], [("data", [("hello.txt", 3), ("level1.map", 4)]),
+                                          ("assets", [(n, 5 + i) for i, n in enumerate(ASSET_NAMES)])])
 
     rom = bytearray(0x4000)
 

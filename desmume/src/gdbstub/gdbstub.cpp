@@ -32,6 +32,7 @@
 
 #include <rthreads/rthreads.h>
 #include "../gdbstub.h"
+#include "../debug_hooks.h"
 #include "../types.h"
 #include "../NDSSystem.h"
 #include "../armcpu.h"
@@ -1599,6 +1600,11 @@ static uint32_t DESMUME_FASTCALL gdb_prefetch32( void *data, uint32_t adr) {
   breakpoint = check_breaks_gdb( stub, stub->instr_breakpoints, adr, 4,
                                  STOP_BREAKPOINT);
 
+  if ( debug_hooks_enabled[DEBUG_HOOK_EXEC] && debug_exec_traced( adr)) {
+    debug_hook( DEBUG_HOOK_EXEC, ((armcpu_t *)stub->cpu_ctrl->data)->proc_ID, adr & ~1);
+  }
+  debug_profile_tick( ((armcpu_t *)stub->cpu_ctrl->data)->proc_ID, adr);
+
     //return stub->real_cpu_memio->prefetch32( stub->real_cpu_memio->data, adr);
   return 0;
 }
@@ -1609,6 +1615,11 @@ static uint16_t DESMUME_FASTCALL gdb_prefetch16( void *data, uint32_t adr) {
 
   breakpoint = check_breaks_gdb( stub, stub->instr_breakpoints, adr, 2,
                                  STOP_BREAKPOINT);
+
+  if ( debug_hooks_enabled[DEBUG_HOOK_EXEC] && debug_exec_traced( adr)) {
+    debug_hook( DEBUG_HOOK_EXEC, ((armcpu_t *)stub->cpu_ctrl->data)->proc_ID, adr & ~1);
+  }
+  debug_profile_tick( ((armcpu_t *)stub->cpu_ctrl->data)->proc_ID, adr);
 
     //return stub->real_cpu_memio->prefetch16( stub->real_cpu_memio->data, adr);
   return 0;

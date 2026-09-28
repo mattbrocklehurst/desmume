@@ -39,7 +39,18 @@
  *                                 destination, gx: on command id and DMA source.
  *                                 break halts the CPU via the gdb stub right after
  *                                 the instruction that caused the event.
+ *            input: KEYINPUT/EXTKEYIN reads, touch: ARM7 touch screen samples,
+ *            input_state: the input applied to a frame changed
  *   hook_status | hook_clear
+ *   trace_add addr=A [ret=0|1] [stack=WORDS] [name=TEXT]
+ *                                 log calls to A (r0-r3, lr, stack) and, with
+ *                                 ret=1, the matching return (r0, r1) without
+ *                                 stopping; needs the gdb stub for that CPU
+ *   trace_remove addr=A | trace_clear | trace_list
+ *   trace_count_add addrs=A,B,.. | trace_count_remove addrs=A,B,..
+ *                                 count-only tracepoints (hits in trace_list)
+ *   profile_start [interval=N] | profile_stop | profile_get
+ *                                 sample (cpu, pc, lr) every N instructions
  *   hook_log [since=SEQ] [limit=N]  records as arrays:
  *            [seq, event, frame, cpu, pc, lr, sp, thumb, a, b, c, d, dma_src, [stack words]]
  *
@@ -77,6 +88,7 @@
 #include "../movie.h"
 #include "../debug_hooks.h"
 #include <deque>
+#include <map>
 
 #ifdef GDB_STUB
 #include "../gdbstub.h"
@@ -120,8 +132,11 @@ FILE *video_pipe = NULL;
 std::string video_path;
 u64 video_frames = 0;
 
-/* event hooks */
-const char *hook_names[DEBUG_HOOK_COUNT] = { "card", "dma", "gx", "swap" };
+/* event hooks. Record event ids beyond the core's are produced here:
+ * "ret" (a traced function returned) and "input_state" (the user input
+ * applied to a frame changed). */
+enum { HOOK_RET = DEBUG_HOOK_COUNT, HOOK_INPUT_STATE, HOOK_TOTAL };
+const char *hook_names[HOOK_TOTAL] = { "card", "dma", "gx", "swap", "exec", "input", "touch", "ret", "input_state" };
 
 struct HookConfig {
 	HookConfig() : action(OFF), min(0), max(0xFFFFFFFF), have_range(false), stack_words(0), frames_left(0), hits(0) {}
@@ -133,7 +148,51 @@ struct HookConfig {
 	u32 frames_left; /* 0 = unlimited */
 	u64 hits;
 };
-HookConfig hooks[DEBUG_HOOK_COUNT];
+HookConfig hooks[HOOK_TOTAL];
+
+/* function tracepoints (exec hook) */
+struct TracePoint {
+	std::string name;
+	bool count_only;
+	bool capture_ret;
+	u32 stack_words;
+	u64 hits;
+};
+std::map<u32, TracePoint> tracepoints;
+
+struct PendingReturn {
+	u32 ret_addr, sp, entry_addr;
+	u64 entry_seq;
+	int cpu;
+};
+std::deque<PendingReturn> pending_returns;
+std::map<u32, int> return_refs;
+const size_t PENDING_RETURNS_MAX = 20000;
+
+/* sampling profiler: (cpu, pc, lr) -> samples */
+struct ProfileKey {
+	u32 cpu, pc, lr, sp_bucket, mode;
+	bool operator<(const ProfileKey &o) const {
+		if (cpu != o.cpu) return cpu < o.cpu;
+		if (pc != o.pc) return pc < o.pc;
+		if (lr != o.lr) return lr < o.lr;
+		if (sp_bucket != o.sp_bucket) return sp_bucket < o.sp_bucket;
+		return mode < o.mode;
+	}
+};
+std::map<ProfileKey, u32> profile_samples;
+u64 profile_total = 0;
+
+void profile_handler(int cpu_num, u32 pc) {
+	armcpu_t &cpu = cpu_num == ARMCPU_ARM9 ? NDS_ARM9 : NDS_ARM7;
+	/* the stack pointer (in 256 byte buckets) tells threads apart */
+	ProfileKey k = { (u32)cpu_num, pc & ~1u, cpu.R[14], cpu.R[13] >> 8, cpu.CPSR.bits.mode };
+	profile_samples[k]++;
+	profile_total++;
+}
+
+u16 last_input_mask = 0;
+u32 last_touch = 0;
 
 struct HookRecord {
 	u64 seq;
@@ -583,7 +642,92 @@ std::string do_dump(const std::string &dir, const std::string &note, bool debugg
 /* ------------------------------------------------------------------ */
 /* event hooks */
 
+u64 add_record(int event, int cpu_num, u32 pc, const u32 *args, u32 dma_src, u32 stack_words) {
+	armcpu_t &cpu = cpu_for(cpu_num);
+	HookRecord r;
+	r.seq = ++hook_seq;
+	r.event = event;
+	r.cpu = cpu_num;
+	r.frame = currFrameCounter;
+	r.pc = pc;
+	r.lr = cpu.R[14];
+	r.sp = cpu.R[13];
+	r.thumb = cpu.CPSR.bits.T;
+	memcpy(r.args, args, sizeof(r.args));
+	r.dma_src = dma_src;
+	for (u32 i = 0; i < stack_words; i++) {
+		u32 addr = r.sp + i * 4;
+		u32 w = 0;
+		for (int b = 0; b < 4; b++) w |= (u32)debug_read8(cpu_num, addr + b) << (b * 8);
+		r.stack.push_back(w);
+	}
+	hook_records.push_back(r);
+	if (hook_records.size() > HOOK_LOG_MAX) hook_records.pop_front();
+	return r.seq;
+}
+
+void exec_update_enabled() {
+	debug_hooks_enabled[DEBUG_HOOK_EXEC] = !tracepoints.empty() || !pending_returns.empty();
+}
+
+void release_return(u32 ret_addr) {
+	if (--return_refs[ret_addr] <= 0) {
+		return_refs.erase(ret_addr);
+		if (!tracepoints.count(ret_addr)) debug_exec_trace_set(ret_addr, false);
+	}
+}
+
+/* a traced address is about to execute: function entries and pending returns */
+void exec_handler(const DebugHookInfo &info) {
+	const u32 addr = info.args[0];
+	armcpu_t &cpu = cpu_for(info.cpu);
+
+	/* returns first: the caller's continuation may itself be traced */
+	for (size_t i = pending_returns.size(); i-- > 0;) {
+		const PendingReturn &p = pending_returns[i];
+		if (p.ret_addr == addr && p.cpu == info.cpu && p.sp == cpu.R[13]) {
+			u32 args[4] = { cpu.R[0], cpu.R[1], p.entry_addr, (u32)p.entry_seq };
+			add_record(HOOK_RET, info.cpu, addr, args, 0, 0);
+			pending_returns.erase(pending_returns.begin() + i);
+			release_return(addr);
+			break;
+		}
+	}
+
+	std::map<u32, TracePoint>::iterator it = tracepoints.find(addr);
+	if (it != tracepoints.end()) {
+		TracePoint &t = it->second;
+		t.hits++;
+		if (t.count_only) {
+			exec_update_enabled();
+			return;
+		}
+		u32 args[4] = { cpu.R[0], cpu.R[1], cpu.R[2], cpu.R[3] };
+		u64 seq = add_record(DEBUG_HOOK_EXEC, info.cpu, addr, args, 0, t.stack_words);
+		if (t.capture_ret) {
+			PendingReturn p;
+			p.ret_addr = cpu.R[14] & ~1;
+			p.sp = cpu.R[13];
+			p.entry_addr = addr;
+			p.entry_seq = seq;
+			p.cpu = info.cpu;
+			pending_returns.push_back(p);
+			if (return_refs[p.ret_addr]++ == 0) debug_exec_trace_set(p.ret_addr, true);
+			if (pending_returns.size() > PENDING_RETURNS_MAX) {
+				/* never returned (longjmp, task switch...): forget the oldest */
+				release_return(pending_returns.front().ret_addr);
+				pending_returns.pop_front();
+			}
+		}
+	}
+	exec_update_enabled();
+}
+
 void hook_handler(const DebugHookInfo &info) {
+	if (info.event == DEBUG_HOOK_EXEC) {
+		exec_handler(info);
+		return;
+	}
 	HookConfig &h = hooks[info.event];
 	if (h.action == HookConfig::OFF) return;
 
@@ -601,27 +745,7 @@ void hook_handler(const DebugHookInfo &info) {
 	if (info.event == DEBUG_HOOK_GX && !h.cmds.empty() && !h.cmds[a[0] & 0xFF]) return;
 
 	h.hits++;
-	armcpu_t &cpu = info.cpu == ARMCPU_ARM9 ? NDS_ARM9 : NDS_ARM7;
-
-	HookRecord r;
-	r.seq = ++hook_seq;
-	r.event = info.event;
-	r.cpu = info.cpu;
-	r.frame = currFrameCounter;
-	r.pc = cpu.instruct_adr;
-	r.lr = cpu.R[14];
-	r.sp = cpu.R[13];
-	r.thumb = cpu.CPSR.bits.T;
-	memcpy(r.args, info.args, sizeof(r.args));
-	r.dma_src = info.dma_source;
-	for (u32 i = 0; i < h.stack_words; i++) {
-		u32 addr = r.sp + i * 4;
-		u32 w = 0;
-		for (int b = 0; b < 4; b++) w |= (u32)debug_read8(info.cpu, addr + b) << (b * 8);
-		r.stack.push_back(w);
-	}
-	hook_records.push_back(r);
-	if (hook_records.size() > HOOK_LOG_MAX) hook_records.pop_front();
+	add_record(info.event, info.cpu, cpu_for(info.cpu).instruct_adr, info.args, info.dma_source, h.stack_words);
 
 	if (h.action == HookConfig::BREAK) {
 		if (!hook_break_fn || !hook_break_fn(info.cpu, hook_names[info.event])) {
@@ -635,13 +759,15 @@ void hooks_update_enabled() {
 	for (int i = 0; i < DEBUG_HOOK_COUNT; i++)
 		debug_hooks_enabled[i] = hooks[i].action != HookConfig::OFF;
 	debug_hook_handler = hook_handler;
+	exec_update_enabled();
 }
 
 std::string hook_status_json() {
 	std::string arr = "[";
-	for (int i = 0; i < DEBUG_HOOK_COUNT; i++) {
+	for (int i = 0; i < HOOK_TOTAL; i++) {
+		if (i == DEBUG_HOOK_EXEC || i == HOOK_RET) continue; /* see trace_list */
 		const HookConfig &h = hooks[i];
-		if (i) arr += ",";
+		if (arr.size() > 1) arr += ",";
 		Json j;
 		j.str("event", hook_names[i])
 		 .str("action", h.action == HookConfig::OFF ? "off" : h.action == HookConfig::LOG ? "log" : "break")
@@ -870,8 +996,9 @@ std::string handle(int client_fd, const std::string &cmd, const Args &args, bool
 	if (cmd == "hook_set") {
 		std::string ev = arg_str(args, "event");
 		int idx = -1;
-		for (int i = 0; i < DEBUG_HOOK_COUNT; i++) if (ev == hook_names[i]) idx = i;
-		if (idx < 0) return error_reply("event must be card, dma, gx or swap");
+		for (int i = 0; i < HOOK_TOTAL; i++) if (ev == hook_names[i]) idx = i;
+		if (idx < 0 || idx == DEBUG_HOOK_EXEC || idx == HOOK_RET)
+			return error_reply("event must be card, dma, gx, swap, input, touch or input_state (use trace_add for code)");
 		HookConfig h;
 		std::string action = arg_str(args, "action", "log");
 		if (action == "off") h.action = HookConfig::OFF;
@@ -881,7 +1008,8 @@ std::string handle(int client_fd, const std::string &cmd, const Args &args, bool
 		h.have_range = args.count("min") || args.count("max");
 		if (!arg_u32(args, "min", h.min, false, 0)) return error_reply("bad min");
 		if (!arg_u32(args, "max", h.max, false, 0xFFFFFFFF)) return error_reply("bad max");
-		if (!arg_u32(args, "stack", h.stack_words, false, idx == DEBUG_HOOK_GX ? 0 : 16) || h.stack_words > 256)
+		const bool no_stack = idx == DEBUG_HOOK_GX || idx == HOOK_INPUT_STATE || idx == DEBUG_HOOK_TOUCH;
+		if (!arg_u32(args, "stack", h.stack_words, false, no_stack ? 0 : 16) || h.stack_words > 256)
 			return error_reply("bad stack (0-256 words)");
 		if (!arg_u32(args, "frames", h.frames_left, false, 0)) return error_reply("bad frames");
 		std::string cmds = arg_str(args, "cmds");
@@ -900,11 +1028,133 @@ std::string handle(int client_fd, const std::string &cmd, const Args &args, bool
 		}
 		h.hits = 0;
 		hooks[idx] = h;
+		if (idx == HOOK_INPUT_STATE) {
+			/* make the first frame report the input that is already held */
+			last_input_mask = 0xFFFF;
+			last_touch = 0xFFFFFFFF;
+		}
 		hooks_update_enabled();
 		return hook_status_json();
 	}
 
 	if (cmd == "hook_status") return hook_status_json();
+
+	if (cmd == "trace_add") {
+		u32 addr, ret, stack;
+		if (!arg_u32(args, "addr", addr, true)) return error_reply("bad addr");
+		if (!arg_u32(args, "ret", ret, false, 1)) return error_reply("bad ret");
+		if (!arg_u32(args, "stack", stack, false, 16) || stack > 256) return error_reply("bad stack (0-256 words)");
+		addr &= ~1;
+		if ((addr & 0xFFC00000) != 0x02000000 && debug_exec_other_count >= 64)
+			return error_reply("too many tracepoints outside main RAM");
+		TracePoint t;
+		t.name = arg_str(args, "name");
+		t.count_only = false;
+		t.capture_ret = ret != 0;
+		t.stack_words = stack;
+		t.hits = 0;
+		tracepoints[addr] = t;
+		debug_exec_trace_set(addr, true);
+		debug_hook_handler = hook_handler;
+		exec_update_enabled();
+		return Json().boolean("ok", true).hex("addr", addr).num("tracepoints", tracepoints.size()).done();
+	}
+
+	if (cmd == "trace_remove" || cmd == "trace_clear") {
+		if (cmd == "trace_clear") {
+			tracepoints.clear();
+			pending_returns.clear();
+			return_refs.clear();
+			debug_exec_trace_clear();
+		} else {
+			u32 addr;
+			if (!arg_u32(args, "addr", addr, true)) return error_reply("bad addr");
+			addr &= ~1;
+			if (!tracepoints.erase(addr)) return error_reply("no tracepoint there");
+			if (!return_refs.count(addr)) debug_exec_trace_set(addr, false);
+		}
+		exec_update_enabled();
+		return Json().boolean("ok", true).num("tracepoints", tracepoints.size()).done();
+	}
+
+	if (cmd == "trace_count_add" || cmd == "trace_count_remove") {
+		/* many count-only tracepoints at once: addrs=A,B,C... */
+		std::string list = arg_str(args, "addrs");
+		size_t start = 0;
+		u32 n = 0;
+		while (start < list.size()) {
+			size_t comma = list.find(',', start);
+			std::string one = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+			u32 addr;
+			if (!parse_u32(one, addr)) return error_reply("bad address " + one);
+			addr &= ~1;
+			if (cmd == "trace_count_add") {
+				if (!tracepoints.count(addr) && ((addr & 0xFFC00000) == 0x02000000 || debug_exec_other_count < 64)) {
+					TracePoint t;
+					t.count_only = true;
+					t.capture_ret = false;
+					t.stack_words = 0;
+					t.hits = 0;
+					tracepoints[addr] = t;
+					debug_exec_trace_set(addr, true);
+					n++;
+				}
+			} else {
+				std::map<u32, TracePoint>::iterator it = tracepoints.find(addr);
+				if (it != tracepoints.end() && it->second.count_only) {
+					tracepoints.erase(it);
+					if (!return_refs.count(addr)) debug_exec_trace_set(addr, false);
+					n++;
+				}
+			}
+			if (comma == std::string::npos) break;
+			start = comma + 1;
+		}
+		debug_hook_handler = hook_handler;
+		exec_update_enabled();
+		return Json().boolean("ok", true).num("changed", n).num("tracepoints", tracepoints.size()).done();
+	}
+
+	if (cmd == "profile_start") {
+		u32 interval;
+		if (!arg_u32(args, "interval", interval, false, 1000) || interval == 0) return error_reply("bad interval");
+		profile_samples.clear();
+		profile_total = 0;
+		debug_profile_handler = profile_handler;
+		debug_profile_countdown[0] = debug_profile_countdown[1] = interval;
+		debug_profile_interval = interval;
+		return Json().boolean("ok", true).num("interval", interval).done();
+	}
+
+	if (cmd == "profile_stop") {
+		debug_profile_interval = 0;
+		return Json().boolean("ok", true).num("samples", (s64)profile_total).done();
+	}
+
+	if (cmd == "profile_get") {
+		/* [[cpu, pc, lr, count, sp_bucket << 8, mode], ...] */
+		std::string out = "[";
+		char buf[64];
+		for (std::map<ProfileKey, u32>::iterator it = profile_samples.begin(); it != profile_samples.end(); ++it) {
+			snprintf(buf, sizeof(buf), "%s[%u,%u,%u,%u,%u,%u]", out.size() > 1 ? "," : "",
+			         it->first.cpu, it->first.pc, it->first.lr, it->second, it->first.sp_bucket << 8, it->first.mode);
+			out += buf;
+		}
+		out += "]";
+		return Json().boolean("ok", true).num("samples", (s64)profile_total)
+		             .boolean("running", debug_profile_interval != 0).raw("counts", out).done();
+	}
+
+	if (cmd == "trace_list") {
+		std::string arr = "[";
+		for (std::map<u32, TracePoint>::iterator it = tracepoints.begin(); it != tracepoints.end(); ++it) {
+			if (arr.size() > 1) arr += ",";
+			arr += Json().hex("addr", it->first).str("name", it->second.name).boolean("ret", it->second.capture_ret)
+			             .num("stack", it->second.stack_words).num("hits", (s64)it->second.hits).done();
+		}
+		arr += "]";
+		return Json().boolean("ok", true).raw("tracepoints", arr).num("pending_returns", pending_returns.size()).done();
+	}
 
 	if (cmd == "hook_clear") {
 		size_t n = hook_records.size();
@@ -1079,6 +1329,23 @@ void ctl_poll(int timeout_ms, bool in_debugger_idle) {
 	}
 }
 
+void ctl_input_applied() {
+	if (hooks[HOOK_INPUT_STATE].action == HookConfig::OFF) return;
+	const UserInput &in = NDS_getFinalUserInput();
+	const UserButtons &b = in.buttons;
+	/* same bit order as the input command: a b select start right left up down r l x y debug - lid */
+	u16 mask = (b.A << 0) | (b.B << 1) | (b.T << 2) | (b.S << 3) | (b.R << 4) | (b.L << 5) | (b.U << 6) | (b.D << 7)
+	         | (b.E << 8) | (b.W << 9) | (b.X << 10) | (b.Y << 11) | (b.G << 12) | (b.F << 14);
+	/* the core keeps touch coordinates in 12.4 fixed point */
+	u32 touch = in.touch.isTouch ? (0x80000000u | (in.touch.touchX >> 4) | ((in.touch.touchY >> 4) << 16)) : 0;
+	if (mask == last_input_mask && touch == last_touch) return;
+	u32 args[4] = { mask, touch, last_input_mask, last_touch };
+	last_input_mask = mask;
+	last_touch = touch;
+	hooks[HOOK_INPUT_STATE].hits++;
+	add_record(HOOK_INPUT_STATE, ARMCPU_ARM9, NDS_ARM9.instruct_adr, args, 0, 0);
+}
+
 void ctl_set_hook_break_fn(int (*fn)(int cpu, const char *name)) {
 	hook_break_fn = fn;
 }
@@ -1125,7 +1392,7 @@ void ctl_frame_done() {
 	frames_emulated++;
 
 	bool hooks_changed = false;
-	for (int i = 0; i < DEBUG_HOOK_COUNT; i++) {
+	for (int i = 0; i < HOOK_TOTAL; i++) {
 		if (hooks[i].action != HookConfig::OFF && hooks[i].frames_left && --hooks[i].frames_left == 0) {
 			hooks[i].action = HookConfig::OFF;
 			hooks_changed = true;

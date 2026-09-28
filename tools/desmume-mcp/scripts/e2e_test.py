@@ -142,7 +142,7 @@ def part1():
     r = T.label_list("tilemap")
     check("label_list", "g_tilemap_copy" in r, r)
     T.label_delete("g_tilemap_copy")
-    check("label_export ghidra", "fs_read_file 0x02000168 f" in T.label_export("ghidra"))
+    check("label_export ghidra", f"fs_read_file {sym['fs_read_file']:#010x} f" in T.label_export("ghidra"))
 
     print("== ROM ==")
     r = T.rom_files()
@@ -224,6 +224,109 @@ def part1():
     check("emu_stop", T.emu_stop() == "stopped")
 
 
+def part3():
+    """Tracing, profiling, recording and the oracle runner."""
+    import subprocess
+    from desmume_mcp import server as T
+
+    print("== tracing and profiling ==")
+    T.emu_start(ROM, headless=True, start_halted=True)
+    T.label_import(path=SYMS)
+    r = T.alloc_track("arena_alloc", "arena_free", size_arg="r1", free_ptr_arg="r1")
+    check("alloc_track", "arena_alloc" in r, r)
+    T.asset_trace_start()
+    T.input_trace_start()
+    r = T.func_trace("fs_read_file")
+    check("func_trace", "fs_read_file" in r, r)
+    T.emu_resume()
+    T.emu_pause()
+    for _ in range(3):
+        T.emu_press(["start"], frames=2, screenshot=False)
+    T.emu_press(["a"], frames=2, screenshot=False)
+
+    r = T.asset_report()
+    check("asset_report names the files", all(f in r for f in ("assets/a.dat", "assets/b.dat", "assets/c.dat",
+                                                               "assets/d.dat", "data/level1.map")), r)
+    check("asset_report finds destinations in allocated buffers", "buffer allocated at" in r, r)
+    check("asset_report call paths", "load_level_assets" in r and "handle_input" in r, r)
+    html = re.search(r"HTML report: (\S+)", r)
+    check("asset_report writes an HTML flow graph", html and os.path.exists(html.group(1)), r)
+    check("asset_report mermaid graph", "flowchart LR" in r, r)
+
+    r = T.alloc_report("summary")
+    check("alloc_report summary", "allocations" in r and "peak" in r, r)
+    r = T.alloc_report("leaks")
+    check("alloc_report finds the c.dat leak", "load_level" in r and "live of" in r, r)
+    ui = T.S.control.read_memory(T.S.labels.lookup_name("g_player") - 0x100, 4)  # just exercise reads
+    r = T.alloc_report("live")
+    first_ptr = re.search(r"(0x[0-9a-f]{8})", r.split("\n", 1)[1]).group(1)
+    r = T.alloc_report("owner", address=first_ptr)
+    check("alloc_report owner", "allocated at frame" in r, r)
+    r = T.alloc_report("graph")
+    check("alloc_report graph", "flowchart LR" in r, r)
+    T.alloc_stop()
+
+    r = T.func_trace_log("fs_read_file", limit=5)
+    check("func_trace_log shows arguments, returns and callers", "calls; callers" in r and "-> r0=" in r
+          and "load_level" in r, r)
+    T.func_trace_stop()
+
+    r = T.input_trace_report(stop=True)
+    check("input_trace_report timeline", "frame" in r and "start" in r and ": a" in r, r)
+    check("input_trace_report finds the KEYINPUT reader", "KEYINPUT" in r and "game_main" in r, r)
+
+    r = T.perf_profile(frames=20)
+    check("perf_profile", "self time" in r and "game_main" in r and "stacks in use" in r, r)
+    r = T.func_hot(frames=20)
+    check("func_hot finds per-frame functions", "once per frame" in r and "handle_input" in r
+          and "build_display_list" in r, r)
+    r = T.nitro_scan()
+    check("nitro_scan fingerprints the card code", "card (" in r and "card_read_block" in r, r)
+
+    print("== record and replay ==")
+    tmp = tempfile.mkdtemp()
+    inputs = os.path.join(tmp, "run.inputs")
+    r = T.input_record_start(inputs)
+    check("input_record_start", "recording" in r, r)
+    T.emu_press(["right"], frames=12, screenshot=False)
+    T.emu_press(["down", "right"], frames=6, screenshot=False)
+    T.emu_touch(100, 90, frames=3, screenshot=False)
+    T.emu_frame_advance(5)
+    r = T.input_record_stop()
+    check("input_record_stop writes a script", "right" in r and "right+down" in r and "touch 100 90" in r, r)
+    x_after = struct.unpack("<i", T.S.control.read_memory(symbols()["g_player"], 4))[0]
+    r = T.input_replay(inputs, sample=["x:s32:g_player"], screenshot=False)
+    xs = [int(v) for v in re.search(r"x: \[([^\]]*)\]", r).group(1).split(",")]
+    check("input_replay reproduces the run", xs[-1] == x_after, f"{xs[-3:]} vs {x_after}")
+    T.emu_stop()
+
+    print("== oracle CLI (headless, no display) ==")
+    env = dict(os.environ)
+    env.pop("DISPLAY", None)
+    env.pop("WAYLAND_DISPLAY", None)
+    env["PYTHONPATH"] = PKG
+    test = os.path.join(PKG, "testgame", "tests", "movement.oracle")
+    res = os.path.join(tmp, "res.json")
+    p = subprocess.run([sys.executable, "-m", "desmume_mcp.oracle", "run", ROM, test, "--labels", SYMS,
+                        "--out", res], env=env, capture_output=True, text=True, timeout=300)
+    check("oracle run passes the movement test", p.returncode == 0 and "PASSED" in p.stderr, p.stderr[-2000:])
+    import json
+    data = json.load(open(res))
+    check("oracle results include per-frame samples", len(data["series"]["x"]) > 10, str(data)[:500])
+    bad = os.path.join(tmp, "bad.oracle")
+    with open(bad, "w") as f:
+        f.write("reset\nwait 10\nexpect s32 g_player == 999\n")
+    p = subprocess.run([sys.executable, "-m", "desmume_mcp.oracle", "run", ROM, bad, "--labels", SYMS,
+                        "--out", res], env=env, capture_output=True, text=True, timeout=300)
+    check("oracle run fails a wrong expectation (exit 1)", p.returncode == 1 and "FAIL line 3" in p.stderr,
+          p.stderr[-2000:])
+    p = subprocess.run([sys.executable, "-m", "desmume_mcp.oracle", "replay", ROM, inputs, "--check",
+                        "--labels", SYMS, "--sample", "x:s32:g_player"], env=env, capture_output=True,
+                       text=True, timeout=300)
+    ok = p.returncode == 0 and '"deterministic": true' in p.stdout
+    check("oracle replay --check is deterministic", ok, p.stdout[-1000:] + p.stderr[-1000:])
+
+
 async def part2():
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
@@ -249,9 +352,10 @@ async def part2():
             check("MCP emu_start", not err and "MCPTESTGAME" in r.content[0].text, r.content[0].text)
             r, err = await call("emu_screenshot")
             check("MCP image content", not err and r.content[0].type == "image")
-            r, err = await call("dbg_break", address="0x0200022c")
+            target = symbols()["build_display_list"]
+            r, err = await call("dbg_break", address=hex(target))
             r, err = await call("dbg_continue", timeout=5)
-            check("MCP breakpoint", not err and "0200022c" in r.content[0].text, r.content[0].text)
+            check("MCP breakpoint", not err and f"{target:08x}" in r.content[0].text, r.content[0].text)
             r, err = await call("mem_read", address="nonexistent_label")
             check("MCP reports errors", err)
             await call("emu_stop")
@@ -261,16 +365,17 @@ def main():
     only_protocol = "--only-protocol" in sys.argv
     if "--keep-data" not in sys.argv:
         os.environ["DESMUME_MCP_HOME"] = tempfile.mkdtemp(prefix="desmume-mcp-test-")
-    try:
-        if not only_protocol:
-            part1()
-    except Exception:
-        traceback.print_exc()
-        check("part 1 completed without exceptions", False)
-        from desmume_mcp import server as T
-        if T.S is not None:
-            print(T.S.log_tail())
-            T.S.stop()
+    for part in ([] if only_protocol else [part1, part3]):
+        try:
+            part()
+        except Exception:
+            traceback.print_exc()
+            check(f"{part.__name__} completed without exceptions", False)
+            from desmume_mcp import server as T
+            if T.S is not None:
+                print(T.S.log_tail())
+                T.S.stop()
+                T.S = None
     print("== MCP protocol ==")
     try:
         asyncio.run(part2())

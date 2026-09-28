@@ -9,7 +9,7 @@ import os
 import re
 import struct
 import time
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, defaultdict
 
 import functools
 
@@ -26,7 +26,10 @@ from .hw import GX_COMMANDS, decode_gx, group_gx, io_name, region_name
 from .memory import (DumpSource, LiveSource, ValueScan, call_graph, find_function_start, function_extent,
                      hexdump, search, words, xrefs)
 from .rom import Rom
+from .oracle import InputScript, Oracle, Recorder, TEST_SCRIPT_HELP, run_test_script
 from .session import Session, SessionError, data_dir
+from .tracking import (AllocTracker, by_site, call_path, find_destination, find_owner, group_loads,
+                       mermaid_graph, write_html)
 
 INSTRUCTIONS = """\
 Drives the DeSmuME Nintendo DS emulator for reverse engineering and debugging.
@@ -76,6 +79,7 @@ def tool():
     return wrap
 
 S = None          # the running Session
+HOOK_CURSOR = {}  # last record shown by hook_log, per session
 SCAN = None       # the current ValueScan
 CALLS = {}        # cached call graphs per source name
 
@@ -962,7 +966,7 @@ def hook_set(event: str, action: str = "log", file: str | None = None, min_addre
     Filters: file='data/map.bin' (card only), or min/max address (card: ROM
     offset, dma: source/destination, gx: DMA source address); gx_commands
     e.g. ['VTX_16','TEXIMAGE_PARAM'] or ids. stack_words: how much stack to
-    snapshot per event for call chains (default 16, 0 for gx). frames: turn
+    snapshot per event for call chains (default 48, 0 for gx). frames: turn
     the hook off after N frames."""
     s = session()
     lo = s.resolve(min_address) if min_address else None
@@ -977,6 +981,8 @@ def hook_set(event: str, action: str = "log", file: str | None = None, min_addre
     if gx_commands:
         by_name = {n: i for i, (n, _) in GX_COMMANDS.items()}
         cmds = [by_name[c.upper()] if c.upper() in by_name else parse_int(c) for c in gx_commands]
+    if stack_words is None and event in ("card", "dma", "swap", "input"):
+        stack_words = 48  # deep enough for call chains through SDK layers
     r = s.hook_set(event, action, lo, hi, cmds, stack_words, frames)
     st = next(h for h in r["hooks"] if h["event"] == event)
     return f"hook {event}: {st['action']}" + (f" range {st.get('min')}-{st.get('max')}" if 'min' in st else "") + \
@@ -991,13 +997,13 @@ def hook_status():
 
 @tool()
 def hook_log(event: str | None = None, limit: int = 50, clear: bool = True, call_chains: bool = True):
-    """Show recorded hook events (oldest first): frame, pc and caller chain,
-    and for card reads the file and offset read. clear=True removes them from
-    the buffer afterwards."""
+    """Show hook events recorded since the last hook_log call (oldest first):
+    frame, pc and caller chain, and for card reads the file and offset read.
+    clear=False shows the same records again next time."""
     s = session()
-    recs = s.hook_records()
-    if clear:
-        s.control.call("hook_clear")
+    recs = s.records_after(HOOK_CURSOR.get(id(s), 0))
+    if clear and recs:
+        HOOK_CURSOR[id(s)] = recs[-1]["seq"]
     if event:
         recs = [r for r in recs if r["event"] == event]
     total = len(recs)
@@ -1038,16 +1044,18 @@ def gx_capture(frames: int = 1, save_path: str | None = None, show: int = 80):
     display list. The full capture is saved as JSON (save_path or the data
     directory)."""
     s = session()
-    s.control.call("hook_clear")
+    s.sync_records()
+    first = s.records_seq
     s.hook_set("gx", "log", stack=0)
     s.hook_set("swap", "log", stack=16)
     # capture one extra frame and cut at SWAP_BUFFERS so that the result
     # holds whole 3D frames even when we start in the middle of one
     emu_frame_advance(frames + 1)
-    recs = s.hook_records()
     s.hook_set("gx", "off")
     s.hook_set("swap", "off")
-    s.control.call("hook_clear")
+    recs = s.records_after(first)
+    # geometry records are bulky and have been reported: drop them
+    s.records = [r for r in s.records if r["event"] != "gx"]
 
     gx_all = [r for r in recs if r["event"] == "gx"]
     swap_idx = [i for i, r in enumerate(gx_all) if r["cmd"] == 0x50]
@@ -1106,6 +1114,666 @@ def gx_capture(frames: int = 1, save_path: str | None = None, show: int = 80):
              "params": params, "decoded": decode_gx(c, params), "dma_src": rec["dma_src"], "pc": rec["pc"]}
             for c, params, rec in cmds]}, f)
     out.append(f"\nfull capture: {path}")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# function tracepoints
+
+
+def _fmt_regs(args, n=4):
+    return " ".join(f"r{i}={v:08x}" for i, v in enumerate(args[:n]))
+
+
+@tool()
+def func_trace(address: str, capture_return: bool = True, stack_words: int = 16, name: str = ""):
+    """Log every call to a function without stopping the game: arguments
+    (r0-r3), caller chain (from a stack snapshot) and, with capture_return,
+    the return value (r0/r1) matched by stack pointer. Read with
+    func_trace_log. Costs little when not hit; works on the ARM9 (or the
+    ARM7 if emu_start had debug_arm7)."""
+    s = session()
+    addr = s.resolve(address) & ~1
+    s.control.call("trace_add", addr=hex(addr), ret=int(capture_return), stack=stack_words,
+                   name=name or s.labels.describe(addr) or "")
+    return f"tracing {s.fmt_addr(addr)}" + (" with return values" if capture_return else "")
+
+
+@tool()
+def func_trace_stop(address: str = "all"):
+    """Stop tracing a function (or all)."""
+    s = session()
+    if address == "all":
+        s.control.call("trace_clear")
+        return "all tracepoints removed"
+    s.control.call("trace_remove", addr=hex(s.resolve(address) & ~1))
+    return "removed"
+
+
+@tool()
+def func_trace_log(address: str | None = None, limit: int = 40, since_frame: int | None = None):
+    """Show traced calls (newest last): frame, arguments, return value and
+    the call path. Also summarises the distinct callers."""
+    s = session()
+    src = s.source(None, "arm9")
+    recs = s.records_after(0)
+    want = s.resolve(address) & ~1 if address else None
+    entries = {}
+    calls = []
+    for r in recs:
+        if r["event"] == "exec" and (want is None or r["pc"] == want):
+            if since_frame is not None and r["frame"] < since_frame:
+                continue
+            c = {"rec": r, "ret": None}
+            entries[r["seq"] & 0xFFFFFFFF] = c
+            calls.append(c)
+        elif r["event"] == "ret" and r["args"][3] in entries:
+            entries[r["args"][3]]["ret"] = r["args"][:2]
+    if not calls:
+        tl = s.control.call("trace_list")
+        return "no calls recorded yet; tracepoints: " + ", ".join(
+            f"{t['addr']} {t['name']} hits={t['hits']}" for t in tl["tracepoints"])
+    callers = defaultdict(int)
+    lines = []
+    for c in calls:
+        r = c["rec"]
+        path = call_path(s, src, r)
+        callers[" > ".join(path[-4:-1])] += 1
+    for c in calls[-limit:]:
+        r = c["rec"]
+        path = call_path(s, src, r)
+        ret = f" -> r0={c['ret'][0]:08x}" if c["ret"] else ""
+        lines.append(f"  f{r['frame']} {s.fmt_addr(r['pc'])}({_fmt_regs(r['args'])}){ret}  "
+                     f"from {' > '.join(path[-4:-1])}")
+    head = [f"{len(calls)} calls; callers:"] + [f"  {n:5}x {k or '?'}" for k, n in
+                                               sorted(callers.items(), key=lambda kv: -kv[1])[:15]]
+    return "\n".join(head + ["", f"last {min(limit, len(calls))} calls:"] + lines)
+
+
+# ---------------------------------------------------------------------------
+# asset loads
+
+
+ASSET_TRACE = {}   # session id -> first record seq
+
+
+@tool()
+def asset_trace_start(stack_words: int = 48):
+    """Start recording game card reads (file loads) with call stacks, plus
+    card DMA transfers. Play or run the game, then call asset_report."""
+    s = session()
+    s.sync_records()
+    ASSET_TRACE[id(s)] = s.records_seq
+    s.hook_set("card", "log", stack=stack_words)
+    s.hook_set("dma", "log", min_addr=0x04100010, max_addr=0x04100010, stack=0)  # card -> RAM DMA
+    return "recording file loads"
+
+
+@tool()
+def asset_report(stop: bool = False, graph: bool = True, html_path: str | None = None, limit: int = 60):
+    """Report file loads since asset_trace_start: frame, file (name from the
+    ROM file system), bytes, where the data landed in RAM, which allocation
+    owns that buffer (if alloc_track is active), and the call path that
+    triggered it. Also returns a Mermaid flow graph (functions -> files) and
+    writes an HTML page with it."""
+    s = session()
+    if id(s) not in ASSET_TRACE:
+        raise SessionError("call asset_trace_start first")
+    recs = s.records_after(ASSET_TRACE[id(s)])
+    if stop:
+        s.hook_set("card", "off")
+        s.hook_set("dma", "off")
+    all_loads = group_loads(s, [r for r in recs if r["event"] == "card"], [r for r in recs if r["event"] == "dma"])
+    # file system bookkeeping (FAT/FNT/header reads) is summarised separately
+    meta = [ld for ld in all_loads if ld["kind"] not in ("file", "arm9", "arm7")]
+    loads = [ld for ld in all_loads if ld["kind"] in ("file", "arm9", "arm7")]
+    allocs = _alloc_analysis(s)["allocs"] if id(s) in ALLOC else []
+    lines = [f"{len(loads)} file loads" + (f" (plus {sum(m['reads'] for m in meta)} reads of file system tables: "
+                                            + ", ".join(sorted({m['file'].split(' (')[0] for m in meta})) + ")"
+                                            if meta else "")]
+    rows = []
+    leaves = []
+    found = []
+    for ld in loads[:limit]:
+        data = b""
+        if ld["kind"] == "file":
+            fid = next((i for i, n in s.rom.files.items() if n == ld["file"]), None)
+            if fid is None:
+                ov = re.match(r"overlay (\w+)#(\d+)", ld["file"])
+                fid = s.rom.overlay(ov.group(1), int(ov.group(2))).file_id if ov else None
+            if fid is not None:
+                data = s.rom.file_data(fid)
+        dests, how = find_destination(s, ld, data) if data else ([], "")
+        found.append((ld, data, dests, how))
+    # an address holding several different files is a staging buffer (e.g.
+    # the card block buffer), not a destination
+    seen = defaultdict(set)
+    for ld, _, dests, _ in found:
+        for d in dests:
+            seen[d].add(ld["file"])
+    for ld, data, dests, how in found:
+        owner = None
+        if allocs:
+            # the buffer allocated most recently before this load started
+            cands = [(find_owner([a for a in allocs if a["seq"] < ld["first_seq"]], d), d) for d in dests]
+            cands = [(a, d) for a, d in cands if a]
+            if cands:
+                owner, best = max(cands, key=lambda ad: ad[0]["seq"])
+                dests = [best]
+        if owner is None:
+            unique = [d for d in dests if len(seen[d]) == 1]
+            if unique and len(unique) < len(dests):
+                dests = unique
+        dest_txt = ", ".join(f"{d:#010x}" for d in dests[:3]) or "?"
+        lines.append(f"  f{ld['frame']}: {ld['file']} ({ld['bytes']:#x} bytes in {ld['reads']} reads)"
+                     f" -> {dest_txt}  [{how}]")
+        if owner:
+            lines.append(f"      buffer allocated at f{owner['frame']}: {owner['size']:#x} bytes by "
+                         f"{' > '.join(owner['path'][-3:])}")
+        lines.append(f"      triggered by: {' > '.join(ld['path'])}")
+        rows.append([ld["frame"], ld["file"], ld["bytes"], dest_txt, " > ".join(ld["path"])])
+        leaves.append((ld["path"], f"{ld['file']} -> {dest_txt}", "file"))
+    out = "\n".join(lines)
+    if graph and leaves:
+        g = mermaid_graph(leaves, "file loads")
+        path = html_path or os.path.join(data_dir(), "reports", f"{s.rom.game_code}-assets.html")
+        write_html(path, f"{s.rom.title}: file loads", g, rows, ["frame", "file", "bytes", "destination", "call path"])
+        out += f"\n\nflow graph (mermaid):\n{g}\n\nHTML report: {path}"
+    return out
+
+
+# ---------------------------------------------------------------------------
+# allocations
+
+
+ALLOC = {}  # session id -> (AllocTracker, first seq)
+
+
+def _alloc_analysis(s):
+    tracker, first = ALLOC[id(s)]
+    return tracker.analyse(s, s.records_after(first))
+
+
+@tool()
+def alloc_track(alloc_function: str, free_function: str | None = None, size_arg: str = "r0",
+                free_ptr_arg: str = "r0", stack_words: int = 32):
+    """Track a game's allocator: every allocation (size, returned pointer,
+    call path, frame) and free. Point it at the game's malloc/new/arena alloc
+    (find it with func_list/func_info: many callers, returns a pointer).
+    size_arg: register holding the size (r1 for arena_alloc(arena, size)).
+    Then use alloc_report."""
+    s = session()
+    a = s.resolve(alloc_function) & ~1
+    f = s.resolve(free_function) & ~1 if free_function else None
+    s.sync_records()
+    s.control.call("trace_add", addr=hex(a), ret=1, stack=stack_words, name="alloc")
+    if f is not None:
+        s.control.call("trace_add", addr=hex(f), ret=0, stack=stack_words, name="free")
+    ALLOC[id(s)] = (AllocTracker(a, f, size_arg, free_ptr_arg), s.records_seq)
+    return f"tracking allocations through {s.fmt_addr(a)}" + (f" and frees through {s.fmt_addr(f)}" if f else "")
+
+
+@tool()
+def alloc_report(view: str = "summary", limit: int = 30, address: str | None = None, html_path: str | None = None):
+    """Allocation report. view: summary (totals, peak, busiest call sites),
+    sites (all call sites: count, bytes, still live), live (outstanding
+    allocations), leaks (call sites whose allocations pile up without being
+    freed), timeline (allocs/frees in order), owner (which allocation holds
+    'address'), graph (Mermaid flow graph of call paths to allocations)."""
+    s = session()
+    if id(s) not in ALLOC:
+        raise SessionError("call alloc_track first")
+    res = _alloc_analysis(s)
+    allocs, live = res["allocs"], res["live"]
+    sites = by_site(allocs)
+    if view == "owner":
+        a = find_owner(allocs, s.resolve(address))
+        if not a:
+            return "no tracked allocation contains that address"
+        return (f"{a['ptr']:#010x}+{a['size']:#x} allocated at frame {a['frame']} by {' > '.join(a['path'])}"
+                + (f"; freed at frame {a['freed_frame']} by {' > '.join(a['freed_by'])}" if a['freed_frame'] is not None else "; still live"))
+    if view == "summary":
+        out = [f"{len(allocs)} allocations ({sum(a['size'] for a in allocs):#x} bytes), {len(res['frees'])} frees",
+               f"live now: {len(live)} blocks, {res['current']:#x} bytes; peak {res['peak']:#x} bytes"]
+        if res["bad_frees"]:
+            out.append(f"{len(res['bad_frees'])} frees of pointers that were not allocated while tracking")
+        out.append("busiest call sites:")
+        for k, v in sorted(sites.items(), key=lambda kv: -kv[1]["bytes"])[:limit]:
+            out.append(f"  {v['count']:4}x {v['bytes']:#8x} bytes, live {v['live']} ({v['live_bytes']:#x})  {k}")
+        return "\n".join(out)
+    if view == "sites":
+        return "\n".join(f"{v['count']:4}x {v['bytes']:#8x} B live {v['live']:3} frames {v['frames'][:6]}  {k}"
+                         for k, v in sorted(sites.items(), key=lambda kv: -kv[1]["count"])[:limit])
+    if view == "live":
+        return f"{len(live)} live allocations\n" + "\n".join(
+            f"  {a['ptr']:#010x} {a['size']:#7x} f{a['frame']}  {' > '.join(a['path'][-4:])}" for a in live[:limit])
+    if view == "leaks":
+        out = []
+        for k, v in sorted(sites.items(), key=lambda kv: -kv[1]["live"]):
+            if v["live"] >= 2 or (v["live"] and v["count"] > v["live"] and False):
+                frames = [a["frame"] for a in live if " > ".join(a["path"][-4:]) == k]
+                out.append(f"  {v['live']} live of {v['count']} ({v['live_bytes']:#x} bytes), allocated at frames "
+                           f"{frames[:10]}: {k}")
+        return ("call sites with several allocations still live (likely leaks if they keep growing):\n"
+                + "\n".join(out[:limit])) if out else "no call site has more than one live allocation"
+    if view == "timeline":
+        events = sorted([(a["seq"], f"f{a['frame']} alloc {a['size']:#x} -> {a['ptr']:#010x}  {' > '.join(a['path'][-3:])}")
+                         for a in allocs] +
+                        [(f["seq"], f"f{f['frame']} free  {f['ptr']:#010x}  {' > '.join(f['path'][-3:])}")
+                         for f in res["frees"]])
+        return "\n".join(e for _, e in events[-limit:])
+    if view == "graph":
+        leaves = [(a["path"], f"{a['size']:#x} bytes" + (" LIVE" if a["freed_frame"] is None else ""), "alloc")
+                  for a in allocs]
+        g = mermaid_graph(leaves, "allocations")
+        path = html_path or os.path.join(data_dir(), "reports", f"{s.rom.game_code}-allocs.html")
+        write_html(path, f"{s.rom.title}: allocations", g,
+                   [[a["frame"], f"{a['ptr']:#010x}", a["size"], "live" if a["freed_frame"] is None else f"freed f{a['freed_frame']}",
+                     " > ".join(a["path"])] for a in allocs], ["frame", "ptr", "size", "state", "call path"])
+        return f"{g}\n\nHTML report: {path}"
+    raise SessionError("view must be summary, sites, live, leaks, timeline, owner or graph")
+
+
+@tool()
+def alloc_stop():
+    """Stop allocation tracking (the collected data stays available)."""
+    s = session()
+    if id(s) not in ALLOC:
+        return "not tracking"
+    tracker, _ = ALLOC[id(s)]
+    s.control.call("trace_remove", addr=hex(tracker.alloc_addr))
+    if tracker.free_addr is not None:
+        s.control.call("trace_remove", addr=hex(tracker.free_addr))
+    return "stopped"
+
+
+# ---------------------------------------------------------------------------
+# input
+
+
+INPUT_TRACE = {}
+
+
+@tool()
+def input_trace_start(stack_words: int = 32):
+    """Record user input: every change of the buttons/touch applied to the
+    game (per frame), the code that reads the key registers (with call
+    stacks), and ARM7 touch screen sampling. Report with input_trace_report."""
+    s = session()
+    s.sync_records()
+    INPUT_TRACE[id(s)] = s.records_seq
+    s.hook_set("input_state", "log")
+    s.hook_set("input", "log", stack=stack_words)
+    s.hook_set("touch", "log", stack=0)
+    return "recording input"
+
+
+@tool()
+def input_trace_report(stop: bool = False, limit: int = 40):
+    """Input timeline and who reads the input: which functions read
+    KEYINPUT/EXTKEYIN (and how often), touch samples, and every change of
+    the input by frame."""
+    s = session()
+    if id(s) not in INPUT_TRACE:
+        raise SessionError("call input_trace_start first")
+    recs = s.records_after(INPUT_TRACE[id(s)])
+    if stop:
+        for ev in ("input_state", "input", "touch"):
+            s.hook_set(ev, "off")
+    src = s.source(None, "arm9")
+    readers = defaultdict(lambda: {"count": 0, "frames": set()})
+    for r in recs:
+        if r["event"] == "input":
+            reg = "KEYINPUT" if r["args"][0] == 0x04000130 else "EXTKEYIN"
+            key = (r["cpu"], reg, " > ".join(call_path(s, s.source(None, r["cpu"]), r)[-4:]))
+            readers[key]["count"] += 1
+            readers[key]["frames"].add(r["frame"])
+    out = ["code reading the input registers:"]
+    for (cpu, reg, path), v in sorted(readers.items(), key=lambda kv: -kv[1]["count"]):
+        per = v["count"] / max(1, len(v["frames"]))
+        out.append(f"  {cpu} {reg}: {v['count']} reads over {len(v['frames'])} frames ({per:.1f}/frame)  {path}")
+    touches = [r for r in recs if r["event"] == "touch"]
+    if touches:
+        frames = sorted({r["frame"] for r in touches})
+        out.append(f"touch screen sampled by the ARM7 in {len(frames)} frames "
+                   f"(pc {s.fmt_addr(touches[0]['pc'])})")
+    changes = [r for r in recs if r["event"] == "input_state"]
+    out.append(f"\n{len(changes)} input changes:")
+    for r in changes[-limit:]:
+        mask, touch = r["args"][0], r["args"][1]
+        held = "+".join(n for i, n in enumerate(["a", "b", "select", "start", "right", "left", "up", "down", "r", "l",
+                                                 "x", "y", "debug", "", "lid"]) if n and mask & (1 << i)) or "-"
+        t = f" touch ({touch & 0xFFFF},{(touch >> 16) & 0x7FFF})" if touch & 0x80000000 else ""
+        out.append(f"  frame {r['frame']}: {held}{t}")
+    return "\n".join(out)
+
+
+RECORDERS = {}
+
+
+@tool()
+def input_record_start(path: str | None = None):
+    """Record the input of this session (your emu_press/emu_touch calls and
+    whatever the user plays in the window) into an input script anchored to
+    a savestate taken now. Stop with input_record_stop; replay with
+    input_replay or the oracle CLI, and feed the same file to another engine."""
+    s = session()
+    if path is None:
+        d = os.path.join(data_dir(), "recordings", s.rom.game_code)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, time.strftime("%Y%m%d-%H%M%S") + ".inputs")
+    RECORDERS[id(s)] = Recorder(s, path)
+    return f"recording input to {path} (start state {RECORDERS[id(s)].state_path}); the game is paused"
+
+
+@tool()
+def input_record_stop():
+    """Finish the recording and write the input script."""
+    s = session()
+    rec = RECORDERS.pop(id(s), None)
+    if rec is None:
+        raise SessionError("not recording")
+    script = rec.stop()
+    with open(rec.out_path) as f:
+        body = "\n".join(l for l in f.read().splitlines() if not l.startswith("#"))
+    return f"wrote {rec.out_path}: {len(script.events)} changes over {script.end} frames\n{body[:3000]}"
+
+
+@tool()
+def input_replay(path: str, sample: list[str] | None = None, screenshot: bool = True):
+    """Replay an input script in this session: load its start state and
+    apply the input frame by frame. sample: values to record every frame,
+    as 'name:type:address' (e.g. 'x:s32:g_player'). Deterministic when the
+    CPU mode matches the recording (see the 'cpu' line)."""
+    s = session()
+    script = InputScript.load(path)
+    o = Oracle.attach(s)
+    if script.cpu != o.cpu_mode:
+        raise SessionError(f"script recorded with cpu {script.cpu}, session uses {o.cpu_mode}")
+    _to_frame_boundary(s)
+    if script.state:
+        o.load(script.state)
+    series = {}
+    probes = [p.split(":", 2) for p in sample or []]
+
+    def on_frame(oracle, f):
+        for name, type_, addr in probes:
+            series.setdefault(name, []).append(oracle.read(addr, type_))
+
+    o.play(script, on_frame if probes else None)
+    text = f"replayed {script.length()} frames from {path}"
+    for name, vals in series.items():
+        text += f"\n{name}: {vals}"
+    return [text, screenshot_image()] if screenshot else text
+
+
+@tool()
+def oracle_run(script_path: str):
+    """Run an oracle test script (see oracle_help) in this session and
+    return the results: probes, per-frame samples and expectations."""
+    s = session()
+    _to_frame_boundary(s)
+    o = Oracle.attach(s)
+    results = {"steps": [], "probes": [], "series": {}, "expects": [], "errors": []}
+    run_test_script(o, script_path, results)
+    results["passed"] = not results["errors"] and all(e["ok"] for e in results["expects"])
+    return json.dumps({k: v for k, v in results.items() if k != "steps"}, indent=1)
+
+
+@tool()
+def oracle_help():
+    """The oracle test script language and the input script format."""
+    from .oracle import INPUT_SCRIPT_FORMAT
+    return TEST_SCRIPT_HELP + "\n" + INPUT_SCRIPT_FORMAT
+
+
+# ---------------------------------------------------------------------------
+# performance: where the time goes, what runs every frame
+
+
+MODE_NAMES = {0x10: "usr", 0x11: "fiq", 0x12: "irq", 0x13: "svc", 0x17: "abt", 0x1B: "und", 0x1F: "sys"}
+
+# hardware fingerprints: (category, registers that must all be touched)
+NITRO_RULES = [
+    ("card", ("ROMCTRL",)), ("card", ("CARD_DATA",)), ("card", ("AUXSPICNT",)),
+    ("pxi_ipc", ("IPCFIFOSEND",)), ("pxi_ipc", ("IPCFIFOCNT",)), ("pxi_ipc", ("IPCSYNC",)),
+    ("irq", ("IME", "IE")), ("irq", ("IF",)), ("irq", ("IME",)),
+    ("math_div", ("DIVCNT",)), ("math_div", ("DIV_NUMER",)), ("math_sqrt", ("SQRTCNT",)),
+    ("pad_input", ("KEYINPUT",)), ("timer", ("TM0CNT",)), ("timer", ("TM1CNT",)), ("timer", ("TM2CNT",)),
+    ("timer", ("TM3CNT",)),
+    ("dma", ("DMA0CNT",)), ("dma", ("DMA1CNT",)), ("dma", ("DMA2CNT",)), ("dma", ("DMA3CNT",)),
+    ("dma_fill", ("DMA0FILL",)), ("dma_fill", ("DMA1FILL",)), ("dma_fill", ("DMA2FILL",)), ("dma_fill", ("DMA3FILL",)),
+    ("gx_vram", ("VRAMCNT_A",)), ("gx_vram", ("VRAMCNT_C",)), ("gx_vram", ("VRAMCNT_E",)), ("gx_wram", ("WRAMCNT",)),
+    ("gx_power", ("POWCNT1",)), ("gx_disp", ("DISPCNT",)), ("gx_disp", ("DISPCNT_SUB",)), ("gx_disp", ("DISPSTAT",)),
+    ("gx_bg", ("BG0CNT",)), ("gx_bg", ("BG0CNT_SUB",)), ("gx_blend", ("BLDCNT",)), ("gx_bright", ("MASTER_BRIGHT",)),
+    ("g3_fifo", ("GXFIFO",)), ("g3_matrix", ("MTX_MODE",)), ("g3_matrix", ("MTX_PUSH",)), ("g3_matrix", ("MTX_LOAD_4x4",)),
+    ("g3_matrix", ("MTX_MULT_4x3",)), ("g3_vtx", ("VTX_16",)), ("g3_vtx", ("BEGIN_VTXS",)), ("g3_tex", ("TEXIMAGE_PARAM",)),
+    ("g3_swap", ("SWAP_BUFFERS",)), ("g3_state", ("DISP3DCNT",)), ("g3_state", ("GXSTAT",)), ("g3_state", ("CLEAR_COLOR",)),
+    ("g3_result", ("POS_RESULT",)), ("g3_result", ("CLIPMTX_RESULT",)), ("g3_light", ("LIGHT_VECTOR",)),
+    ("exmem", ("EXMEMCNT",)),
+]
+
+
+class FuncIndex:
+    """Maps addresses to functions using labels plus the call graph (the
+    function containing pc is the nearest call target at or below it)."""
+
+    def __init__(self, s, src):
+        import bisect
+        self._bisect = bisect
+        self.s = s
+        graph = _graph(src)
+        starts = {t & ~1 for t in graph}
+        starts |= {a for a, e in s.labels.labels.items() if e["type"] == "func"}
+        self.starts = sorted(starts)
+        self.graph = graph
+
+    def start_of(self, addr):
+        i = self._bisect.bisect_right(self.starts, addr & ~1) - 1
+        if i < 0:
+            return None
+        start = self.starts[i]
+        return start if (addr & ~1) - start < 0x4000 else None
+
+    def name(self, addr):
+        start = self.start_of(addr)
+        if start is None:
+            return f"{addr:#010x}"
+        label = self.s.labels.labels.get(start)
+        return label["name"] if label else f"sub_{start:08x}"
+
+
+def _irq_handler(s):
+    """ARM9 IRQ handler: the BIOS jumps to the address stored at DTCM+0x3FFC."""
+    try:
+        dtcm = int(s.control.call("memory_map")["dtcm"], 16)
+        return struct.unpack("<I", s.control.read_memory(dtcm + 0x3FFC, 4))[0]
+    except (ControlError, KeyError, ValueError):
+        return None
+
+
+@tool()
+def perf_profile(frames: int = 60, interval: int = 500, limit: int = 25, cpu: str = "arm9"):
+    """Sampling profiler: run N frames sampling the CPU every `interval`
+    instructions, then report the functions where the time goes (self time)
+    and who calls them. Idle loops (waiting for VBlank) show up too, which
+    tells you where the frame ends."""
+    s = session()
+    for g in s.gdb.values():
+        if not g.is_running():
+            g.cont()
+    s.control.call("profile_start", interval=interval)
+    try:
+        emu_frame_advance(frames)
+    finally:
+        s.control.call("profile_stop")
+    r = s.control.call("profile_get")
+    want = 0 if cpu == "arm9" else 1
+    counts = [c for c in r["counts"] if c[0] == want]
+    total = sum(c[3] for c in counts) or 1
+    idx = FuncIndex(s, s.source(None, cpu))
+    self_time = Counter()
+    callers = defaultdict(Counter)
+    hot_pcs = defaultdict(Counter)
+    stacks = defaultdict(lambda: [0, Counter(), Counter()])  # sp bucket -> [samples, funcs, modes]
+    for _, pc, lr, n, sp, mode in counts:
+        f = idx.name(pc)
+        self_time[f] += n
+        hot_pcs[f][pc] += n
+        callers[f][idx.name(lr & ~1)] += n
+        st = stacks[sp]
+        st[0] += n
+        st[1][f] += n
+        st[2][MODE_NAMES.get(mode, hex(mode))] += n
+    lines = [f"{total} samples over {frames} frames ({cpu}, every {interval} instructions)",
+             "self time by function:"]
+    for f, n in self_time.most_common(limit):
+        top_pc = hot_pcs[f].most_common(1)[0][0]
+        who = ", ".join(f"{c} {v * 100 // n}%" for c, v in callers[f].most_common(3))
+        lines.append(f"  {n * 100 / total:5.1f}%  {f:<28} hottest {top_pc:#010x}  lr (approx.) in: {who}")
+    # every thread (and the IRQ/SVC modes) runs on its own stack: cluster
+    # the samples by stack pointer to see them
+    clusters = []
+    for sp in sorted(stacks):
+        n, funcs, modes = stacks[sp]
+        if clusters and sp - clusters[-1]["hi"] <= 0x1000 and set(modes) == set(clusters[-1]["modes"]):
+            c = clusters[-1]
+            c["hi"] = sp
+            c["n"] += n
+            c["funcs"].update(funcs)
+            c["modes"].update(modes)
+        else:
+            clusters.append({"lo": sp, "hi": sp, "n": n, "funcs": Counter(funcs), "modes": Counter(modes)})
+    lines.append(f"\nstacks in use ({len(clusters)}; each thread and each exception mode has its own):")
+    for c in sorted(clusters, key=lambda c: -c["n"]):
+        lines.append(f"  sp {c['lo']:#010x}-{c['hi'] + 0xFF:#010x} {c['n'] * 100 / total:5.1f}% "
+                     f"mode {'/'.join(c['modes'])}: " + ", ".join(f for f, _ in c["funcs"].most_common(5)))
+    return "\n".join(lines)
+
+
+@tool()
+def func_hot(frames: int = 60, limit: int = 25, source: str | None = None):
+    """Count calls to every known function (all direct call targets plus
+    labelled functions) over N frames. Reports functions called exactly once
+    per frame (game tick / update / render candidates, with how they nest),
+    the most called functions, and the IRQ handler. Slows emulation while
+    it runs."""
+    s = session()
+    src = s.source(source, "arm9")
+    idx = FuncIndex(s, src)
+    targets = sorted({t & ~1 for t in idx.graph} | set(idx.starts))
+    irq = _irq_handler(s)
+    if irq and 0x01FF8000 <= (irq & ~1) < 0x02400000:
+        targets.append(irq & ~1)
+    added = []
+    for i in range(0, len(targets), 400):
+        chunk = targets[i:i + 400]
+        s.control.call("trace_count_add", addrs=",".join(hex(a) for a in chunk))
+        added.extend(chunk)
+    try:
+        before = {int(t["addr"], 16): t["hits"] for t in s.control.call("trace_list")["tracepoints"]}
+        for g in s.gdb.values():
+            if not g.is_running():
+                g.cont()
+        emu_frame_advance(frames)
+        after = {int(t["addr"], 16): t["hits"] for t in s.control.call("trace_list")["tracepoints"]}
+    finally:
+        for i in range(0, len(added), 400):
+            s.control.call("trace_count_remove", addrs=",".join(hex(a) for a in added[i:i + 400]))
+    hits = {a: after.get(a, 0) - before.get(a, 0) for a in added}
+    called = {a: n for a, n in hits.items() if n}
+
+    def nm(a):
+        label = s.labels.labels.get(a)
+        return label["name"] if label else f"sub_{a:08x}"
+
+    once = sorted(a for a, n in called.items() if n == frames)
+    lines = [f"{len(called)} of {len(added)} functions ran during {frames} frames"]
+    if irq:
+        lines.append(f"IRQ handler (from DTCM+0x3FFC): {s.fmt_addr(irq & ~1)} ran {hits.get(irq & ~1, 0)} times "
+                     f"({hits.get(irq & ~1, 0) / frames:.1f}/frame)")
+    lines.append(f"\ncalled exactly once per frame ({len(once)}) - tick/update/render candidates:")
+    once_set = set(once)
+    for a in once[:limit * 2]:
+        sites = idx.graph.get(a, []) + idx.graph.get(a | 1, [])
+        callers_ = sorted({idx.name(site) for site in sites})
+        callees = sorted({nm(t & ~1) for t, st in idx.graph.items()
+                          if (t & ~1) in once_set and any(idx.start_of(x) == a for x in st)})
+        lines.append(f"  {s.fmt_addr(a)}  called from {', '.join(callers_[:4]) or '?'}"
+                     + (f"  -> calls per-frame {', '.join(callees[:6])}" if callees else ""))
+    per_frame = sorted(((n / frames, a) for a, n in called.items() if n % frames == 0 and n > frames),
+                       reverse=True)
+    if per_frame:
+        lines.append("\ncalled a whole number of times every frame (loops over objects/entities?):")
+        for rate, a in per_frame[:limit]:
+            lines.append(f"  {rate:6.0f}/frame  {s.fmt_addr(a)}")
+    lines.append("\nmost called:")
+    for a, n in sorted(called.items(), key=lambda kv: -kv[1])[:limit]:
+        lines.append(f"  {n:8} ({n / frames:8.1f}/frame)  {s.fmt_addr(a)}")
+    return "\n".join(lines)
+
+
+@tool()
+def nitro_scan(apply: bool = False, source: str | None = None, max_functions: int = 6000):
+    """Identify the Nintendo SDK (NitroSDK/TwlSDK) and middleware in the
+    game and fingerprint functions by the hardware they touch (card I/O,
+    IPC with the ARM7, interrupts, divide unit, DMA, 2D/3D registers...).
+    SDK code is statically linked, so these low level functions are the
+    same in every game of an SDK version; knowing them names the layers
+    above (file system, threads, graphics). apply=True labels unlabelled
+    functions as <category>_<address> with the evidence as a comment."""
+    s = session()
+    src = s.source(source, "arm9")
+    out = []
+    # 1. version markers
+    markers = set()
+    for blob in (s.rom.arm9_binary(),) + tuple(s.rom.overlay_binary("arm9", o.id) for o in s.rom.overlays
+                                                if o.cpu == "arm9")[:64]:
+        for m in re.finditer(rb"\[SDK\+[ -~]{3,80}?\]", blob):
+            markers.add(m.group(0).decode())
+    out.append("SDK/middleware markers: " + (", ".join(sorted(markers)) if markers else
+                                             "none found (not a Nitro SDK game, or stripped)"))
+
+    # 2. hardware fingerprints
+    idx = FuncIndex(s, src)
+    starts = idx.starts[:max_functions]
+    found = defaultdict(list)
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else start + 0x400
+        end = min(end, start + 0x1000)
+        raw = src.read(start, end - start + 0x40)
+        # cheap filter: only functions with an I/O address in reach
+        if not any(0x04000000 <= w < 0x05000000 for w in struct.unpack(f"<{len(raw) // 4}I", raw[:len(raw) // 4 * 4])):
+            continue
+        thumb = _is_thumb_func(src, start)
+        size = 2 if thumb else 4
+        listing = s.disassemble(src, start | (1 if thumb else 0), max(1, min((end - start) // size, 400)),
+                                thumb=thumb)
+        regs = {n.split("+")[0] for n in re.findall(r"io:(\S+)", listing)}
+        if not regs:
+            continue
+        cats = []
+        for cat, need in NITRO_RULES:
+            if all(r in regs for r in need) and cat not in cats:
+                cats.append(cat)
+        if cats:
+            found[cats[0]].append((start, sorted(regs), cats))
+    applied = 0
+    for cat in sorted(found):
+        items = found[cat]
+        out.append(f"\n{cat} ({len(items)}):")
+        for start, regs, cats in items[:25]:
+            label = s.labels.labels.get(start)
+            out.append(f"  {s.fmt_addr(start)}  touches {', '.join(regs[:8])}"
+                       + (f"  (also {', '.join(cats[1:])})" if len(cats) > 1 else ""))
+            if apply and not label:
+                s.labels.set(start, f"{cat}_{start:08x}", "func", 0, "auto (nitro_scan): touches " + ", ".join(regs[:8]))
+                applied += 1
+    if apply:
+        out.append(f"\nlabelled {applied} functions")
+    irq = _irq_handler(s)
+    if irq:
+        out.append(f"\nIRQ handler (DTCM+0x3FFC): {s.fmt_addr(irq & ~1)}")
     return "\n".join(out)
 
 

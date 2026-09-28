@@ -75,6 +75,11 @@ static const char* help_string = \
 #endif
 " --disable-sound            Disables the sound output" ENDL
 " --disable-limiter          Disables the 60fps limiter" ENDL
+" --rtc-fixed                The clock starts at 2000-01-01 00:00 and follows" ENDL
+"                            emulated time (reproducible runs)" ENDL
+" --deterministic            --rtc-fixed plus a fixed seed for the emulator's" ENDL
+"                            own randomness (microphone noise etc.), so runs" ENDL
+"                            from the same state and input are identical" ENDL
 " --rtc-day D                Override RTC day, 0=Sunday, 6=Saturday" ENDL
 " --rtc-hour H               Override RTC hour, 0=midnight, 23=an hour before" ENDL
 " --frameskip N              Set frameskip to N; default 0" ENDL
@@ -134,6 +139,8 @@ ENDL
 #endif
 "Arguments affecting automation:" ENDL
 " --control-port PORTNUM     Listen for control commands on 127.0.0.1:PORTNUM" ENDL
+" --headless                 No window, audio or X server; implies" ENDL
+"                            --disable-limiter (desmume-cli only)" ENDL
 "                            (desmume-cli only, see tools/desmume-mcp)" ENDL
 ENDL
 "Utility commands which occur in place of emulation:" ENDL
@@ -243,6 +250,9 @@ CommandLine::CommandLine()
 	_slot1_no8000prot         = 0;
 	disable_sound             = 0;
 	disable_limiter           = 0;
+	headless                  = 0;
+	rtc_fixed                 = 0;
+	deterministic             = 0;
 	windowed_fullscreen       = 0;
 	frameskip                 = 0;
 	horizontal                = 0;
@@ -287,6 +297,9 @@ bool CommandLine::parse(int argc,char **argv)
 			{ "frameskip", required_argument, NULL, OPT_FRAMESKIP},
 			{ "disable-sound", no_argument, &disable_sound, 1},
 			{ "disable-limiter", no_argument, &disable_limiter, 1},
+			{ "headless", no_argument, &headless, 1},
+			{ "rtc-fixed", no_argument, &rtc_fixed, 1},
+			{ "deterministic", no_argument, &deterministic, 1},
 			{ "rtc-day", required_argument, NULL, OPT_RTC_DAY},
 			{ "rtc-hour", required_argument, NULL, OPT_RTC_HOUR},
 
@@ -646,6 +659,12 @@ void CommandLine::process_addonCommands()
         if (diff < 0)
                 diff += 24 * 7;
         rtcHourOverride = diff;
+    }
+    if (rtc_fixed || deterministic) {
+        rtcFixedClock = true;
+    }
+    if (deterministic) {
+        srand(0);
     }
 }
 

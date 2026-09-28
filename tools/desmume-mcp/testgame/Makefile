@@ -7,7 +7,7 @@
 CC      = arm-none-eabi-gcc
 OBJCOPY = arm-none-eabi-objcopy
 NM      = arm-none-eabi-nm
-CFLAGS  = -mcpu=arm946e-s -marm -mthumb-interwork -O2 -ffreestanding -nostdlib
+CFLAGS  = -mcpu=arm946e-s -marm -mthumb-interwork -O2 -ffreestanding -nostdlib -Wno-multichar
 
 all: testgame.nds testgame.sym
 

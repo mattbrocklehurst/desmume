@@ -1580,6 +1580,7 @@ void DESMUME_FASTCALL MMU_writeToSPIData(u16 val)
 				break;
 
 				case TSC_MEASURE_Y:
+					debug_hook(DEBUG_HOOK_TOUCH, ARMCPU_ARM7, channel, nds.adc_touchY, nds.isTouch, nds.scr_touchX | (nds.scr_touchY << 16));
 					//counter the number of adc touch coord reads and jitter it after a while to simulate a shaky human hand or multiple reads
 					//this is actually important for some games.. seemingly due to bugs.
 					nds.adc_jitterctr++;
@@ -1658,6 +1659,7 @@ void DESMUME_FASTCALL MMU_writeToSPIData(u16 val)
 				}
 
 				case TSC_MEASURE_X:
+					debug_hook(DEBUG_HOOK_TOUCH, ARMCPU_ARM7, channel, nds.adc_touchX, nds.isTouch, nds.scr_touchX | (nds.scr_touchY << 16));
 					if(spicnt & 0x800)
 					{
 						if(partie)
@@ -5272,6 +5274,7 @@ u8 DESMUME_FASTCALL _MMU_ARM9_read08(u32 adr)
 
 			case REG_KEYINPUT:
 				LagFrameFlag=0;
+				debug_hook(DEBUG_HOOK_INPUT, ARMCPU_ARM9, REG_KEYINPUT, T1ReadWord(MMU.ARM9_REG, 0x130));
 				break;
 		}
 	}
@@ -5372,6 +5375,7 @@ u16 DESMUME_FASTCALL _MMU_ARM9_read16(u32 adr)
 
 			case REG_KEYINPUT:
 				LagFrameFlag=0;
+				debug_hook(DEBUG_HOOK_INPUT, ARMCPU_ARM9, REG_KEYINPUT, T1ReadWord(MMU.ARM9_REG, 0x130));
 				break;
 
 			//fog table: write only
@@ -5524,6 +5528,7 @@ u32 DESMUME_FASTCALL _MMU_ARM9_read32(u32 adr)
 
 			case REG_KEYINPUT:
 				LagFrameFlag=0;
+				debug_hook(DEBUG_HOOK_INPUT, ARMCPU_ARM9, REG_KEYINPUT, T1ReadWord(MMU.ARM9_REG, 0x130));
 				break;
 
 			// Ensata sound register
@@ -5964,6 +5969,9 @@ u8 DESMUME_FASTCALL _MMU_ARM7_read08(u32 adr)
 {
 	adr &= 0x0FFFFFFF;
 
+	if (debug_hooks_enabled[DEBUG_HOOK_INPUT] && ((adr & ~1) == 0x04000130 || (adr & ~1) == 0x04000136))
+		debug_hook(DEBUG_HOOK_INPUT, ARMCPU_ARM7, adr & ~1, T1ReadWord(MMU.ARM7_REG, adr & 0xFFFE));
+
 	mmu_log_debug_ARM7(adr, "(read08) 0x%02X", MMU.MMU_MEM[ARMCPU_ARM7][(adr>>20)&0xFF][adr&MMU.MMU_MASK[ARMCPU_ARM7][(adr>>20)&0xFF]]);
 
 	if (adr < 0x4000)
@@ -6045,6 +6053,9 @@ u8 DESMUME_FASTCALL _MMU_ARM7_read08(u32 adr)
 u16 DESMUME_FASTCALL _MMU_ARM7_read16(u32 adr)
 {
 	adr &= 0x0FFFFFFE;
+
+	if (debug_hooks_enabled[DEBUG_HOOK_INPUT] && (adr == 0x04000130 || adr == 0x04000136))
+		debug_hook(DEBUG_HOOK_INPUT, ARMCPU_ARM7, adr, T1ReadWord(MMU.ARM7_REG, adr & 0xFFFF));
 
 	mmu_log_debug_ARM7(adr, "(read16) 0x%04X", T1ReadWord(MMU.MMU_MEM[ARMCPU_ARM7][(adr>>20)&0xFF], adr & MMU.MMU_MASK[ARMCPU_ARM7][(adr>>20)&0xFF]));
 
@@ -6131,6 +6142,12 @@ u16 DESMUME_FASTCALL _MMU_ARM7_read16(u32 adr)
 u32 DESMUME_FASTCALL _MMU_ARM7_read32(u32 adr)
 {
 	adr &= 0x0FFFFFFC;
+
+	if (debug_hooks_enabled[DEBUG_HOOK_INPUT] && (adr == 0x04000130 || adr == 0x04000134))
+	{
+		const u32 reg = adr == 0x04000130 ? 0x04000130 : 0x04000136;
+		debug_hook(DEBUG_HOOK_INPUT, ARMCPU_ARM7, reg, T1ReadWord(MMU.ARM7_REG, reg & 0xFFFF));
+	}
 
 	mmu_log_debug_ARM7(adr, "(read32) 0x%08X", T1ReadLong(MMU.MMU_MEM[ARMCPU_ARM7][(adr>>20)&0xFF], adr & MMU.MMU_MASK[ARMCPU_ARM7][(adr>>20)&0xFF]));
 

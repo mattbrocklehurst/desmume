@@ -58,6 +58,9 @@ bool ctl_quit_requested();
  * mask and applies/releases touch screen input */
 u16 ctl_pre_frame(u16 keypad);
 
+/* called once the input for the next frame is final (after movie playback) */
+void ctl_input_applied();
+
 /* called after a frame has been emulated and drawn */
 void ctl_frame_done();
 

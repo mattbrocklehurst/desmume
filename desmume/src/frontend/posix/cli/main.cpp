@@ -280,6 +280,7 @@ resizeWindow_stub (u16 width, u16 height, void *screen_texture) {
 }
 
 static void Draw(class configured_features *cfg) {
+	if (!window) return; /* headless */
 	const float scale = cfg->scale;
 	const unsigned w = GPU_FRAMEBUFFER_NATIVE_WIDTH, h = GPU_FRAMEBUFFER_NATIVE_HEIGHT;
 	const int ws = w * scale, hs = h * scale;
@@ -359,6 +360,7 @@ static void desmume_cycle(struct ctrls_event_config * cfg)
     FCEUMOV_HandlePlayback();
     NDS_endProcessingInput();
     FCEUMOV_HandleRecording();
+    ctl_input_applied();
 
     NDS_exec<false>();
     SPU_Emulate_user();
@@ -478,6 +480,8 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "Control interface listening on 127.0.0.1:%d\n", my_config.control_port);
   }
+  if (my_config.start_paused)
+    ctl_toggle_pause();
 
 #ifdef GDB_STUB
   gdbstub_mutex_init();
@@ -517,6 +521,12 @@ int main(int argc, char ** argv) {
   }
 #endif
 
+  if (my_config.headless) {
+    /* for CI and farms: no X server, window, audio or joysticks, full speed */
+    my_config.disable_sound = 1;
+    my_config.disable_limiter = 1;
+  }
+
   if ( !my_config.disable_sound) {
     SPU_ChangeSoundCore(SNDCORE_SDL, 735 * 4);
   }
@@ -536,6 +546,13 @@ int main(int argc, char ** argv) {
 
   execute = true;
 
+  if (my_config.headless) {
+    if (SDL_Init(SDL_INIT_TIMER | SDL_INIT_EVENTS) == -1) {
+      fprintf(stderr, "Error trying to initialize SDL: %s\n", SDL_GetError());
+      return 1;
+    }
+    fprintf(stderr, "Running headless\n");
+  } else {
   /* X11 multi-threading support */
   if(!XInitThreads())
     {
@@ -577,6 +594,7 @@ int main(int argc, char ** argv) {
   /* Load keyboard and joystick configuration */
   keyfile = desmume_config_read_file(cli_kb_cfg, "SDLKEYS");
   desmume_config_dispose(keyfile);
+  }
 
   if(my_config.load_slot != -1){
     loadstate_slot(my_config.load_slot);
@@ -619,8 +637,10 @@ int main(int argc, char ** argv) {
     desmume_cycle(&ctrls_cfg);
 
 #ifdef HAVE_LIBAGG
-    osd->update();
-    DrawHUD();
+    if (!my_config.headless) {
+      osd->update();
+      DrawHUD();
+    }
 #endif
 
     Draw(&my_config);
@@ -668,7 +688,7 @@ int main(int argc, char ** argv) {
 
       snprintf( win_title, sizeof(win_title), "Desmume %.02f", fps);
 
-      SDL_SetWindowTitle( window, win_title );
+      if (window) SDL_SetWindowTitle( window, win_title );
     }
 #endif
   }
@@ -676,7 +696,7 @@ int main(int argc, char ** argv) {
   ctl_shutdown();
 
   /* Unload joystick */
-  uninit_joy();
+  if (!my_config.headless) uninit_joy();
 
 #ifdef GDB_STUB
   destroyStub_gdb( stubs[0]);

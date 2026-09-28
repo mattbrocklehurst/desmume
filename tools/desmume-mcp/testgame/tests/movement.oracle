@@ -1,0 +1,21 @@
+# Oracle test for the test game: the player starts at (100, 80), moves 2
+# pixels per frame with the d-pad, and loses 7 HP when A is pressed.
+# Run: python3 -m desmume_mcp.oracle run ../testgame.nds movement.oracle --labels ../testgame.sym
+reset
+wait 10
+expect s32 g_player == 100
+expect s32 g_player+4 == 80
+sample x s32 g_player
+press right 5
+expect s32 g_player == 110
+press down+right 3
+expect s32 g_player == 116
+expect s32 g_player+4 == 86
+press left 4
+expect s32 g_player == 108
+probe hp_before s32 g_player+8
+press a 1
+wait 1
+expect s32 g_player+8 == 43
+probe hp_after s32 g_player+8
+screenshot movement-end.png

@@ -139,7 +139,7 @@ class Breakpoint:
 
 class Session:
     def __init__(self, rom_path, desmume=None, arm7=False, headless=None, start_halted=False,
-                 extra_args=(), sound=None):
+                 extra_args=(), sound=None, debugger=True, jit=False, deterministic=True):
         self.rom_path = os.path.abspath(rom_path)
         if not os.path.isfile(self.rom_path):
             raise SessionError(f"ROM not found: {rom_path}")
@@ -152,6 +152,10 @@ class Session:
         self.sound = (not headless) if sound is None else sound
         self.start_halted = start_halted
         self.extra_args = list(extra_args)
+        # the gdb stub forces the interpreter; without it the JIT can be used
+        self.debugger = debugger
+        self.jit = jit and not debugger
+        self.deterministic = deterministic
         self.data_dir = data_dir()
         self.labels = LabelDB(os.path.join(self.data_dir, "labels", f"{self.rom.game_code or 'UNKNOWN'}.json"))
         self.dump_root = os.path.join(self.data_dir, "dumps", self.rom.game_code or "UNKNOWN")
@@ -164,31 +168,35 @@ class Session:
         self.next_bp = 1
         self.scan = None
         self._dis = None
+        # every hook record fetched so far (see sync_records)
+        self.records = []
+        self.records_seq = 0
         self.log_path = None
 
     # lifecycle --------------------------------------------------------------
 
     def start(self, timeout=20.0):
-        self.ports = {"control": free_port(), "arm9": free_port()}
-        if self.arm7:
-            self.ports["arm7"] = free_port()
-        cmd = [self.desmume, "--control-port", str(self.ports["control"]),
-               "--arm9gdb", str(self.ports["arm9"])]
-        if self.arm7:
-            cmd += ["--arm7gdb", str(self.ports["arm7"])]
-        if not self.sound:
+        self.ports = {"control": free_port()}
+        cmd = [self.desmume, "--control-port", str(self.ports["control"])]
+        if self.debugger:
+            self.ports["arm9"] = free_port()
+            cmd += ["--arm9gdb", str(self.ports["arm9"])]
+            if self.arm7:
+                self.ports["arm7"] = free_port()
+                cmd += ["--arm7gdb", str(self.ports["arm7"])]
+        if self.jit:
+            cmd.append("--jit-enable")
+        if self.deterministic:
+            cmd.append("--deterministic")
+        if self.headless:
+            cmd.append("--headless")  # no window, X server or audio; no frame limiter
+        elif not self.sound:
             cmd.append("--disable-sound")
         cmd += self.extra_args + [self.rom_path]
         env = dict(os.environ)
         env["DESMUME_DUMP_DIR"] = self.dump_root
         if not self.sound:
             env.setdefault("SDL_AUDIODRIVER", "dummy")
-        if self.headless:
-            xvfb = shutil.which("xvfb-run")
-            if not xvfb:
-                raise SessionError("no display and xvfb-run is not installed (apt install xvfb), "
-                                   "or start with headless=false on a desktop")
-            cmd = [xvfb, "-a"] + cmd
 
         os.makedirs(os.path.join(self.data_dir, "logs"), exist_ok=True)
         os.makedirs(self.dump_root, exist_ok=True)
@@ -210,6 +218,8 @@ class Session:
                     raise SessionError(f"timed out waiting for desmume-cli:\n{self.log_tail()}")
                 time.sleep(0.2)
 
+        if not self.debugger:
+            return
         # both CPUs start halted, waiting for the debugger
         for cpu in ("arm9", "arm7") if self.arm7 else ("arm9",):
             self.attach(cpu)
@@ -276,6 +286,8 @@ class Session:
         return self._dis
 
     def g(self, cpu="arm9"):
+        if not self.debugger:
+            raise SessionError("this session was started without the debugger")
         if cpu not in self.gdb:
             raise SessionError(f"the debugger is not attached to {cpu} (use dbg_attach)")
         return self.gdb[cpu]
@@ -669,7 +681,7 @@ class Session:
 
     # event hooks -------------------------------------------------------------
 
-    HOOK_EVENTS = ("card", "dma", "gx", "swap")
+    HOOK_EVENTS = ("card", "dma", "gx", "swap", "exec", "input", "touch", "ret", "input_state")
 
     def hook_set(self, event, action="log", min_addr=None, max_addr=None, cmds=None, stack=None, frames=None):
         args = {"event": event, "action": action}
@@ -702,14 +714,33 @@ class Session:
             if not r["more"] or len(out) >= limit or not r["records"]:
                 return out
 
-    def chain_from_snapshot(self, rec, src=None):
-        """Call chain for a hook record, from its pc/lr and stack snapshot."""
+    MAX_RECORDS = 1000000
+
+    def sync_records(self):
+        """Pull new hook records from the emulator into self.records (the one
+        place all reports read from). Returns the new records."""
+        new = self.hook_records(since=self.records_seq, limit=10 ** 7)
+        if new:
+            self.records_seq = new[-1]["seq"]
+            self.records.extend(new)
+            if len(self.records) > self.MAX_RECORDS:
+                del self.records[:len(self.records) - self.MAX_RECORDS]
+        return new
+
+    def records_after(self, seq, event=None):
+        self.sync_records()
+        return [r for r in self.records if r["seq"] > seq and (event is None or r["event"] == event)]
+
+    def chain_sites(self, rec, src=None):
+        """Call chain of a hook record as addresses: where it happened, then
+        the call sites found through lr and the stack snapshot (innermost
+        first)."""
         src = src or self.source(None, rec["cpu"])
-        chain = [self.fmt_addr(rec["pc"])]
+        chain = [rec["pc"]]
         seen = set()
         lr_call = is_call_before(src, rec["lr"]) if rec["lr"] else None
         if lr_call:
-            chain.append(self.fmt_addr(lr_call[0]))
+            chain.append(lr_call[0])
             seen.add(lr_call[0])
         code = src.code_regions()
         for w in rec["stack"]:
@@ -718,5 +749,9 @@ class Session:
             call = is_call_before(src, w)
             if call and call[0] not in seen:
                 seen.add(call[0])
-                chain.append(self.fmt_addr(call[0]))
+                chain.append(call[0])
         return chain
+
+    def chain_from_snapshot(self, rec, src=None):
+        """Call chain for a hook record, formatted with labels."""
+        return [self.fmt_addr(a) for a in self.chain_sites(rec, src)]
