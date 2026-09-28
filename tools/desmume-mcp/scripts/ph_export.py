@@ -486,6 +486,13 @@ def main():
         if not shutil.which(tool):
             sys.exit(f"{tool} is needed")
 
+    if args.push:
+        check = subprocess.run(["git", "-C", args.dest_repo, "symbolic-ref", "--short", "HEAD"],
+                               capture_output=True, text=True)
+        if check.returncode != 0:
+            sys.exit(f"--dest-repo {args.dest_repo} is not a git checkout ({check.stderr.strip()}); "
+                     f"clone it first, e.g. git clone git@github.com:OWNER/REPO.git {args.dest_repo}")
+
     rom_bytes = open(args.rom, "rb").read()
     rom = Rom(args.rom)
     ph = get_ph(args.ph)
