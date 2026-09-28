@@ -57,6 +57,12 @@ activateStub_gdb( gdbstub_handle_t stub);
    returns 0 on failure or if no response was available. */
 int gdbstub_wait( gdbstub_handle_t *stubs, long timeout);
 
+/* stop the CPU right after the instruction that is currently executing and
+ * report it to gdb as SIGTRAP with a "hook:<name>" field in the stop reply.
+ * Used by event hooks (see debug_hooks.h). Must be called from the emulation
+ * thread. Returns 0 if no debugger is connected. */
+int gdbstub_break_now( gdbstub_handle_t stub, const char *hook_name);
+
 /* enable or disable use of the pipe for gdbstub_wait() */
 void gdbstub_wait_set_enabled(gdbstub_handle_t stub, int on);
 

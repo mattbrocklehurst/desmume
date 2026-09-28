@@ -47,6 +47,7 @@
 #include "GPU.h"
 #include "SPU.h"
 #include "emufile.h"
+#include "debug_hooks.h"
 
 #ifdef DO_ASSERT_UNALIGNED
 #define ASSERT_UNALIGNED(x) assert(x)
@@ -1337,6 +1338,14 @@ void DESMUME_FASTCALL MMU_writeToGCControl(u32 val)
 	if(start)
 	{
 		GCLOG("[GC] command:"); rawcmd.print();
+		if (debug_hooks_enabled[DEBUG_HOOK_CARD])
+		{
+			const u8 *b = rawcmd.bytes;
+			const u32 hi = (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
+			const u32 lo = (b[4] << 24) | (b[5] << 16) | (b[6] << 8) | b[7];
+			const u32 rom_addr = (b[0] == 0xB7) ? ((b[1] << 24) | (b[2] << 16) | (b[3] << 8) | b[4]) : 0;
+			debug_hook(DEBUG_HOOK_CARD, PROCNUM, hi, lo, blocksize, rom_addr);
+		}
 		slot1_device->write_command(PROCNUM, rawcmd);
 
 		/*INFO("WRITE: %02X%02X%02X%02X%02X%02X%02X%02X ", 
@@ -2325,6 +2334,8 @@ void DmaController::doCopy()
 	u32 src = saddr;
 	u32 dst = daddr;
 
+	debug_hook(DEBUG_HOOK_DMA, PROCNUM, chan | (startmode << 8), saddr, daddr, todo * sz);
+
 	//if these do not use MMU_AT_DMA and the corresponding code in the read/write routines,
 	//then danny phantom title screen will be filled with a garbage char which is made by
 	//dmaing from 0x00000000 to 0x06000000
@@ -2338,6 +2349,7 @@ void DmaController::doCopy()
 			time_elapsed += _MMU_accesstime<PROCNUM,MMU_AT_DMA,32,MMU_AD_READ,TRUE>(src,true);
 			time_elapsed += _MMU_accesstime<PROCNUM,MMU_AT_DMA,32,MMU_AD_WRITE,TRUE>(dst,true);
 			u32 temp = _MMU_read32(procnum,MMU_AT_DMA,src);
+			debug_hook_dma_source = src;
 			_MMU_write32(procnum,MMU_AT_DMA,dst, temp);
 			dst += dstinc;
 			src += srcinc;
@@ -2348,11 +2360,13 @@ void DmaController::doCopy()
 			time_elapsed += _MMU_accesstime<PROCNUM,MMU_AT_DMA,16,MMU_AD_READ,TRUE>(src,true);
 			time_elapsed += _MMU_accesstime<PROCNUM,MMU_AT_DMA,16,MMU_AD_WRITE,TRUE>(dst,true);
 			u16 temp = _MMU_read16(procnum,MMU_AT_DMA,src);
+			debug_hook_dma_source = src;
 			_MMU_write16(procnum,MMU_AT_DMA,dst, temp);
 			dst += dstinc;
 			src += srcinc;
 		}
 	}
+	debug_hook_dma_source = 0;
 
 	//printf("ARM%c dma of size %d from 0x%08X to 0x%08X took %d cycles\n",PROCNUM==0?'9':'7',todo*sz,saddr,daddr,time_elapsed);
 

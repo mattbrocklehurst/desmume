@@ -2103,10 +2103,14 @@ void NDS_debug_step()
 	singleStep = true;
 }
 
+//true while NDS_exec is running a frame (read under the gdb stub mutex)
+volatile bool nds_exec_active = false;
+
 template<bool FORCE>
 void NDS_exec(s32 nb)
 {
 	GDBSTUB_MUTEX_LOCK();
+	nds_exec_active = true;
 
 	LagFrameFlag=1;
 
@@ -2249,6 +2253,7 @@ void NDS_exec(s32 nb)
 	
 	CommonSettings.gamehacks.execute();
 
+	nds_exec_active = false;
 	GDBSTUB_MUTEX_UNLOCK();
 }
 

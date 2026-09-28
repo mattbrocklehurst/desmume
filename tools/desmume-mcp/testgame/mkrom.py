@@ -21,6 +21,15 @@ ARM9_ADDR = 0x02000000
 ARM7_ADDR = 0x02380000
 OVERLAY0_ADDR = 0x02100000
 
+# 4x4 tilemap, one byte per tile (0 = empty); read by the game with
+# fs_read_file(4, ...) - keep the file id in sync with FILE_LEVEL1 in game.c
+LEVEL1_MAP = bytes([
+    1, 1, 1, 1,
+    1, 0, 2, 1,
+    1, 3, 0, 1,
+    1, 1, 1, 1,
+])
+
 # ARM7: just spin (b .)
 ARM7_CODE = struct.pack("<I", 0xEAFFFFFE)
 
@@ -87,8 +96,9 @@ def main():
         overlay1,                                        # id 1: overlay 1 (compressed)
         b"DeSmuME MCP test game\n",                      # id 2: readme.txt
         b"hello from the data directory\n",              # id 3: data/hello.txt
+        LEVEL1_MAP,                                      # id 4: data/level1.map
     ]
-    fnt = build_fnt([("readme.txt", 2)], [("data", [("hello.txt", 3)])])
+    fnt = build_fnt([("readme.txt", 2)], [("data", [("hello.txt", 3), ("level1.map", 4)])])
 
     rom = bytearray(0x4000)
 
@@ -96,6 +106,9 @@ def main():
     arm9_off = len(rom)
     rom += arm9
     align(rom, 0x200)
+    # retail cards only serve data reads from 0x8000 up, so everything the
+    # game loads at runtime goes above that (as in real ROMs)
+    rom.extend(b"\xff" * max(0, 0x8000 - len(rom)))
 
     # ARM9 overlay table (y9), 32 bytes per entry; bit 24 of the last word
     # flags compression, the low 24 bits hold the compressed size

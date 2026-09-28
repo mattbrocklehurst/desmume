@@ -475,3 +475,29 @@ bool DebugNotify::ping(EDEBUG_NOTIFY which)
 	pingBits[(int)which] = true;
 	return !wasPinged;
 }
+
+
+//------------------------------------------------------------------------------
+// event hooks for debugging tools (see debug_hooks.h)
+
+#include "debug_hooks.h"
+
+bool debug_hooks_enabled[DEBUG_HOOK_COUNT];
+DebugHookHandler debug_hook_handler = NULL;
+u32 debug_hook_dma_source = 0;
+
+void debug_hook_dispatch(DebugHookEvent event, int cpu, u32 a, u32 b, u32 c, u32 d)
+{
+	if (!debug_hook_handler)
+		return;
+
+	DebugHookInfo info;
+	info.event = event;
+	info.cpu = cpu;
+	info.args[0] = a;
+	info.args[1] = b;
+	info.args[2] = c;
+	info.args[3] = d;
+	info.dma_source = debug_hook_dma_source;
+	debug_hook_handler(info);
+}

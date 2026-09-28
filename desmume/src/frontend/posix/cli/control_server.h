@@ -47,6 +47,10 @@ bool ctl_is_paused();
 void ctl_toggle_pause();
 void ctl_hotkey_dump();
 
+/* lets event hooks with action=break halt a CPU through the gdb stub; fn
+ * returns 0 when no debugger is attached to that CPU */
+void ctl_set_hook_break_fn(int (*fn)(int cpu, const char *name));
+
 /* true when a client asked the emulator to exit */
 bool ctl_quit_requested();
 

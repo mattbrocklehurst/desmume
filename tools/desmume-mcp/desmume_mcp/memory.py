@@ -511,3 +511,44 @@ class ValueScan:
             self.cands[start] = (keep_idx, keep_vals)
         self.history.append(f"{condition} {value if value is not None else ''}".strip())
         return self.count()
+
+
+# ---------------------------------------------------------------------------
+# function discovery (for labelling)
+
+
+def call_graph(src, regions):
+    """Scan for direct calls. Returns {target: [call sites]} where thumb
+    targets have bit 0 set."""
+    calls = {}
+    for name, start, end in regions:
+        data = src.read(start, end - start)
+        n = len(data)
+        for off in range(0, n - 3, 4):
+            w = struct.unpack_from("<I", data, off)[0]
+            if (w >> 25) & 7 != 0b101:
+                continue
+            br = arm_branch_target(w, start + off)
+            if br and br[0] in ("bl", "blx") and in_regions(br[1] & ~1, regions):
+                calls.setdefault(br[1], []).append(start + off)
+        for off in range(0, n - 3, 2):
+            hi = data[off + 1]
+            if hi & 0xF8 != 0xF0:
+                continue
+            h, lo = struct.unpack_from("<HH", data, off)
+            bl = thumb_bl_target(h, lo, start + off)
+            if bl and in_regions(bl[1] & ~1, regions):
+                calls.setdefault(bl[1], []).append(start + off)
+    # drop targets that are almost certainly data misread as instructions:
+    # a real function is called from more than one place or starts with a push
+    return calls
+
+
+def function_extent(src, start, thumb, known_starts, max_insns=600):
+    """Guess where the function at start ends: the next known function start,
+    or the first unconditional return that is followed by padding/another
+    push, capped at max_insns."""
+    size = 2 if thumb else 4
+    limit = start + max_insns * size
+    nxt = min((a & ~1 for a in known_starts if (a & ~1) > start), default=limit)
+    return min(nxt, limit)

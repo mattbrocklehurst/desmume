@@ -213,6 +213,44 @@ class Rom:
             data = blz_decompress(data[:ov.compressed_size] if ov.compressed_size else data)
         return data
 
+    def file_at(self, rom_offset):
+        """Map a ROM offset to what lives there: (kind, name, offset_within)."""
+        o = rom_offset
+        if o < 0x200:
+            return "header", "header", o
+        if self.arm9_off <= o < self.arm9_off + self.arm9_size:
+            return "arm9", "arm9 binary", o - self.arm9_off
+        if self.arm7_off <= o < self.arm7_off + self.arm7_size:
+            return "arm7", "arm7 binary", o - self.arm7_off
+        if self.fnt_off <= o < self.fnt_off + self.fnt_size:
+            return "fnt", "file name table", o - self.fnt_off
+        if self.fat_off <= o < self.fat_off + self.fat_size:
+            return "fat", f"file allocation table (entry {(o - self.fat_off) // 8})", o - self.fat_off
+        if self.ovt9_off <= o < self.ovt9_off + self.ovt9_size:
+            return "ovt", "arm9 overlay table", o - self.ovt9_off
+        for fid in range(self.fat_size // 8):
+            start, end = self.file_extent(fid)
+            if start <= o < end:
+                name = self.files.get(fid)
+                if name is None:
+                    ov = next((x for x in self.overlays if x.file_id == fid), None)
+                    name = f"overlay {ov.cpu}#{ov.id}" if ov else f"file#{fid}"
+                return "file", name, o - start
+        return "unknown", "unknown", 0
+
+    def find_file(self, name):
+        """File id by path (case-insensitive, suffix match allowed)."""
+        name = name.lower().lstrip("/")
+        exact = [fid for fid, n in self.files.items() if n.lower() == name]
+        if exact:
+            return exact[0]
+        partial = [fid for fid, n in self.files.items() if n.lower().endswith(name)]
+        if len(partial) == 1:
+            return partial[0]
+        if partial:
+            raise KeyError(f"'{name}' is ambiguous: " + ", ".join(self.files[f] for f in partial[:10]))
+        raise KeyError(f"no file named {name}")
+
     def overlays_at(self, addr, cpu="arm9"):
         return [ov for ov in self.overlays
                 if ov.cpu == cpu and ov.ram_addr <= addr < ov.ram_addr + ov.ram_size]

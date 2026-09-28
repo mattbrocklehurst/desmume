@@ -82,3 +82,4 @@ xcuserdata/
 /config.log
 /.project
 .DS_Store
+/desmume/src/frontend/posix/build/

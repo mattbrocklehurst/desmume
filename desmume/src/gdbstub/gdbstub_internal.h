@@ -48,7 +48,8 @@ enum stop_type {
   STOP_BREAKPOINT,
   STOP_WATCHPOINT,
   STOP_RWATCHPOINT,
-  STOP_AWATCHPOINT
+  STOP_AWATCHPOINT,
+  STOP_HOOK
 };
 
 struct armcpu_ctrl_iface;
@@ -191,6 +192,9 @@ struct gdb_stub_state {
    * the following resume with an immediate stop, leaving the CPU exactly
    * after the access. */
   int swallow_step;
+
+  /** name of the debug hook that requested the last STOP_HOOK stop */
+  char hook_name[32];
 
   /** The step break point decsriptor */
   struct breakpoint_gdb step_breakpoint_descr;

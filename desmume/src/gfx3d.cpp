@@ -50,6 +50,7 @@
 #include "readwrite.h"
 #include "FIFO.h"
 #include "utils/bits.h"
+#include "debug_hooks.h"
 #include "movie.h" //only for currframecounter which really ought to be moved into the core emu....
 
 //#define _SHOW_VTX_COUNTERS	// show polygon/vertex counters on screen
@@ -3196,6 +3197,8 @@ void gfx3d_execute3D()
 
 void gfx3d_glFlush(const u32 param)
 {
+	debug_hook(DEBUG_HOOK_SWAP, ARMCPU_ARM9, param);
+
 	//printf("-------------FLUSH------------- (vcount=%d\n",nds.VCount);
 #if 0
 	if (gfx3d.isSwapBuffersPending)

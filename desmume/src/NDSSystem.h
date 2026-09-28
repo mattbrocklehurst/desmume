@@ -59,6 +59,7 @@ extern buttonstruct<bool> Turbo;
 extern buttonstruct<u32> TurboTime;
 extern buttonstruct<bool> AutoHold;
 extern volatile bool execute;
+extern volatile bool nds_exec_active;
 extern BOOL click;
 
 /*

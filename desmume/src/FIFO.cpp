@@ -18,6 +18,7 @@
 */
 
 #include "FIFO.h"
+#include "debug_hooks.h"
 
 #include <string.h>
 
@@ -229,6 +230,8 @@ static bool IsMatrixStackCommand(u8 cmd)
 
 void GFX_FIFOsend(u8 cmd, u32 param)
 {
+	debug_hook(DEBUG_HOOK_GX, ARMCPU_ARM9, cmd, param);
+
 	//INFO("gxFIFO: send 0x%02X = 0x%08X (size %03i/0x%02X) gxstat 0x%08X\n", cmd, param, gxFIFO.size, gxFIFO.size, gxstat);
 	//printf("fifo recv: %02X: %08X upto:%d\n",cmd,param,gxFIFO.size+1);
 

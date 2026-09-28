@@ -13,6 +13,7 @@ import time
 
 from .control import ControlClient, ControlError
 from .gdbrsp import GdbClient, GdbError, SIGINT
+from .hw import io_name
 from .labels import LabelDB
 from .memory import (Disassembler, DumpSource, LiveSource, RomSource, arm_branch_target,
                      branch_target, find_function_start, is_call_before, stack_scan,
@@ -54,6 +55,66 @@ def free_port():
 
 def slug(text):
     return re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-")[:40] or "dump"
+
+
+REG_ALIAS = {"sb": "r9", "sl": "r10", "fp": "r11", "ip": "r12", "sp": "r13", "lr": "r14", "pc": "r15"}
+CONDS = ("eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le")
+NO_DEST = ("str", "cmp", "cmn", "tst", "teq", "b", "push", "stm", "pld", "svc", "swi", "bkpt", "nop", "mcr")
+
+
+def _reg(name):
+    return REG_ALIAS.get(name, name)
+
+
+def _track_consts(consts, mnem, ops, lit_val):
+    """Update known register values after one instruction (conservative)."""
+    base = mnem.split(".")[0]
+    cond = len(base) > 3 and base[-2:] in CONDS and base[:-2] in ("mov", "mvn", "add", "sub", "orr", "ldr", "movs", "adds", "subs")
+    if cond:
+        base = base[:-2]
+    if base in ("bl", "blx") or base.startswith("bl"):
+        for r in ("r0", "r1", "r2", "r3", "r12", "r14"):
+            consts.pop(r, None)
+        return
+    if base in ("b", "bx") or base.startswith(("pop", "ldm")) and "pc" in ops:
+        consts.clear()
+        return
+    if base.startswith(("pop", "ldm")):
+        for r in re.findall(r"\b(r\d+|sb|sl|fp|ip|lr)\b", ops):
+            consts.pop(_reg(r), None)
+        return
+    if base.startswith(NO_DEST) and not base.startswith(("sub", "strex")):
+        if "]!" in ops or re.search(r"\], #", ops):  # writeback changes the base register
+            m = re.search(r"\[(\w+)", ops)
+            if m:
+                consts.pop(_reg(m.group(1)), None)
+        return
+    toks = [t.strip() for t in ops.split(",")]
+    if not toks or not toks[0]:
+        return
+    dest = _reg(toks[0])
+    value = None
+    try:
+        if base.startswith("ldr") and lit_val is not None and base in ("ldr",):
+            value = lit_val
+        elif base in ("mov", "movs") and len(toks) == 2 and toks[1].startswith("#"):
+            value = int(toks[1][1:], 0) & 0xFFFFFFFF
+        elif base in ("mvn", "mvns") and len(toks) == 2 and toks[1].startswith("#"):
+            value = ~int(toks[1][1:], 0) & 0xFFFFFFFF
+        elif base in ("add", "adds", "sub", "subs", "orr", "orrs") and toks[-1].startswith("#"):
+            src_reg = _reg(toks[1]) if len(toks) == 3 else dest
+            if src_reg in consts:
+                imm = int(toks[-1][1:], 0)
+                v = consts[src_reg]
+                value = (v + imm if base.startswith("add") else v - imm if base.startswith("sub") else v | imm) & 0xFFFFFFFF
+        elif base in ("mov", "movs") and len(toks) == 2 and _reg(toks[1]) in consts:
+            value = consts[_reg(toks[1])]
+    except ValueError:
+        value = None
+    if value is None or cond:
+        consts.pop(dest, None)
+    else:
+        consts[dest] = value
 
 
 class Breakpoint:
@@ -282,39 +343,49 @@ class Session:
     # disassembly -----------------------------------------------------------
 
     def disassemble(self, src, addr, count=20, thumb=None, pc=None, cpu="arm9"):
+        """Listing with labels, literal pool values, and memory operands
+        resolved through simple register constant tracking, so that code like
+        'ldr r2, =0x04000100; str r3, [r2, #0xa4]' is annotated with ROMCTRL."""
         if thumb is None:
             thumb = bool(addr & 1)
         addr &= ~1 if thumb else ~3
-        size = 2 if thumb else 4
         data = src.read(addr, count * 4 + 4)
         bps = {bp.addr for bp in self.breakpoints.values() if bp.kind == "exec" and bp.cpu == cpu}
         lines = [f"; {src.name} {'thumb' if thumb else 'arm'}"]
+        consts = {}
         for a, sz, raw, mnem, ops in self.dis.disasm(data, addr, thumb=thumb, count=count):
             label = self.labels.labels.get(a)
             if label:
                 lines.append(f"{label['name']}:" + (f"    ; {label['comment']}" if label.get("comment") else ""))
+                if label["type"] == "func":
+                    consts.clear()
             marker = "=>" if pc is not None and a == pc else "  "
             marker += "*" if a in bps else " "
             text = f"{mnem} {ops}".strip()
-            t = branch_target(ops) if mnem.startswith(("b", "bl", "blx", "cb")) else None
             notes = []
+            t = branch_target(ops) if mnem.startswith(("b", "cb")) else None
             if t is not None:
-                name = self.labels.describe(t)
+                name = self.labels.describe(t & ~1)
                 if name:
                     notes.append(f"<{name}>")
+            lit_val = None
             m = re.search(r"\[pc, #(-?0x[0-9a-f]+|-?\d+)\]", ops)
             if m and mnem.startswith("ldr"):
                 lit = ((a + (4 if thumb else 8)) & ~3) + int(m.group(1), 0)
                 try:
-                    val = src.u32(lit)
-                    name = self.labels.describe(val)
-                    notes.append(f"={val:#010x}" + (f" <{name}>" if name else ""))
+                    lit_val = src.u32(lit)
+                    name = self.labels.describe(lit_val)
+                    notes.append(f"={lit_val:#010x}" + (f" <{name}>" if name else ""))
                 except Exception:
                     pass
-            if label is None:
-                c = self.labels.labels.get(a, {}).get("comment")
-                if c:
-                    notes.append(c)
+            else:
+                mem = re.search(r"\[(\w+)(?:, #(-?0x[0-9a-f]+|-?\d+))?\]", ops)
+                if mem and _reg(mem.group(1)) in consts:
+                    target = (consts[_reg(mem.group(1))] + int(mem.group(2) or "0", 0)) & 0xFFFFFFFF
+                    io = io_name(target)
+                    name = self.labels.describe(target)
+                    notes.append(f"io:{io}" if io else f"[{target:#010x}]" + (f" <{name}>" if name else ""))
+            _track_consts(consts, mnem, ops, lit_val)
             lines.append(f"{marker}{a:08x}: {raw.hex():<8}  {text:<32}" + (" ; " + " ".join(notes) if notes else ""))
         return "\n".join(lines)
 
@@ -559,6 +630,9 @@ class Session:
                 hits.append(snap)
         finally:
             self.remove_breakpoint(bp)
+            g = self.gdb.get(cpu)
+            if g is not None and not g.is_running() and hits and "other_stop" not in hits[-1]:
+                g.cont()  # carry on, as before the trace
         return hits
 
     # dumps -----------------------------------------------------------------
@@ -592,3 +666,57 @@ class Session:
     def function_of(self, src, addr, thumb):
         start = find_function_start(src, addr | (1 if thumb else 0), thumb)
         return start
+
+    # event hooks -------------------------------------------------------------
+
+    HOOK_EVENTS = ("card", "dma", "gx", "swap")
+
+    def hook_set(self, event, action="log", min_addr=None, max_addr=None, cmds=None, stack=None, frames=None):
+        args = {"event": event, "action": action}
+        if min_addr is not None:
+            args["min"] = hex(min_addr)
+        if max_addr is not None:
+            args["max"] = hex(max_addr)
+        if cmds:
+            args["cmds"] = ",".join(hex(c) for c in cmds)
+        if stack is not None:
+            args["stack"] = stack
+        if frames:
+            args["frames"] = frames
+        return self.control.call("hook_set", **args)
+
+    def hook_records(self, since=0, limit=100000):
+        """Fetch hook records as dicts."""
+        out = []
+        while True:
+            r = self.control.call("hook_log", since=since, limit=min(limit - len(out), 20000))
+            for x in r["records"]:
+                out.append({
+                    "seq": x[0], "event": self.HOOK_EVENTS[x[1]], "frame": x[2],
+                    "cpu": "arm9" if x[3] == 0 else "arm7", "pc": x[4], "lr": x[5], "sp": x[6],
+                    "thumb": bool(x[7]), "args": x[8:12], "dma_src": x[12], "stack": x[13],
+                    # for gx records
+                    "cmd": x[8], "param": x[9],
+                })
+            since = r["last_seq"]
+            if not r["more"] or len(out) >= limit or not r["records"]:
+                return out
+
+    def chain_from_snapshot(self, rec, src=None):
+        """Call chain for a hook record, from its pc/lr and stack snapshot."""
+        src = src or self.source(None, rec["cpu"])
+        chain = [self.fmt_addr(rec["pc"])]
+        seen = set()
+        lr_call = is_call_before(src, rec["lr"]) if rec["lr"] else None
+        if lr_call:
+            chain.append(self.fmt_addr(lr_call[0]))
+            seen.add(lr_call[0])
+        code = src.code_regions()
+        for w in rec["stack"]:
+            if not any(start <= (w & ~1) < end for _, start, end in code):
+                continue
+            call = is_call_before(src, w)
+            if call and call[0] not in seen:
+                seen.add(call[0])
+                chain.append(self.fmt_addr(call[0]))
+        return chain

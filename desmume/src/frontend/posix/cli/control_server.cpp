@@ -33,6 +33,15 @@
  *   movie_record path=FILE.dsm [from=now|reset] | movie_play path=FILE.dsm | movie_stop
  *   video_record path=FILE.mp4 | video_stop       (needs ffmpeg in PATH)
  *   dump dir=DIR [note=TEXT]      freeze the emulator and write a full state dump
+ *   hook_set event=card|dma|gx|swap action=log|break|off [min=A] [max=A]
+ *            [cmds=ID,ID..] [stack=WORDS] [frames=N]
+ *                                 card: filter on ROM address, dma: on source or
+ *                                 destination, gx: on command id and DMA source.
+ *                                 break halts the CPU via the gdb stub right after
+ *                                 the instruction that caused the event.
+ *   hook_status | hook_clear
+ *   hook_log [since=SEQ] [limit=N]  records as arrays:
+ *            [seq, event, frame, cpu, pc, lr, sp, thumb, a, b, c, d, dma_src, [stack words]]
  *
  * Numbers accept decimal or 0x prefixed hex.
  */
@@ -66,6 +75,8 @@
 #include "../GPU.h"
 #include "../saves.h"
 #include "../movie.h"
+#include "../debug_hooks.h"
+#include <deque>
 
 #ifdef GDB_STUB
 #include "../gdbstub.h"
@@ -108,6 +119,35 @@ int touch_frames = 0;
 FILE *video_pipe = NULL;
 std::string video_path;
 u64 video_frames = 0;
+
+/* event hooks */
+const char *hook_names[DEBUG_HOOK_COUNT] = { "card", "dma", "gx", "swap" };
+
+struct HookConfig {
+	HookConfig() : action(OFF), min(0), max(0xFFFFFFFF), have_range(false), stack_words(0), frames_left(0), hits(0) {}
+	enum { OFF, LOG, BREAK } action;
+	u32 min, max;
+	bool have_range;
+	std::vector<bool> cmds; /* gx command filter, empty = all */
+	u32 stack_words;
+	u32 frames_left; /* 0 = unlimited */
+	u64 hits;
+};
+HookConfig hooks[DEBUG_HOOK_COUNT];
+
+struct HookRecord {
+	u64 seq;
+	u8 event, cpu, thumb;
+	s32 frame;
+	u32 pc, lr, sp;
+	u32 args[4];
+	u32 dma_src;
+	std::vector<u32> stack;
+};
+std::deque<HookRecord> hook_records;
+u64 hook_seq = 0;
+const size_t HOOK_LOG_MAX = 500000;
+int (*hook_break_fn)(int cpu, const char *name) = NULL;
 
 const int SCREEN_W = 256;
 const int SCREEN_H = 384; /* both screens stacked */
@@ -541,6 +581,80 @@ std::string do_dump(const std::string &dir, const std::string &note, bool debugg
 }
 
 /* ------------------------------------------------------------------ */
+/* event hooks */
+
+void hook_handler(const DebugHookInfo &info) {
+	HookConfig &h = hooks[info.event];
+	if (h.action == HookConfig::OFF) return;
+
+	const u32 *a = info.args;
+	if (h.have_range) {
+		bool in = false;
+		switch (info.event) {
+		case DEBUG_HOOK_CARD: in = a[3] >= h.min && a[3] <= h.max; break;
+		case DEBUG_HOOK_DMA: in = (a[1] >= h.min && a[1] <= h.max) || (a[2] >= h.min && a[2] <= h.max); break;
+		case DEBUG_HOOK_GX: in = info.dma_source >= h.min && info.dma_source <= h.max; break;
+		default: in = true; break;
+		}
+		if (!in) return;
+	}
+	if (info.event == DEBUG_HOOK_GX && !h.cmds.empty() && !h.cmds[a[0] & 0xFF]) return;
+
+	h.hits++;
+	armcpu_t &cpu = info.cpu == ARMCPU_ARM9 ? NDS_ARM9 : NDS_ARM7;
+
+	HookRecord r;
+	r.seq = ++hook_seq;
+	r.event = info.event;
+	r.cpu = info.cpu;
+	r.frame = currFrameCounter;
+	r.pc = cpu.instruct_adr;
+	r.lr = cpu.R[14];
+	r.sp = cpu.R[13];
+	r.thumb = cpu.CPSR.bits.T;
+	memcpy(r.args, info.args, sizeof(r.args));
+	r.dma_src = info.dma_source;
+	for (u32 i = 0; i < h.stack_words; i++) {
+		u32 addr = r.sp + i * 4;
+		u32 w = 0;
+		for (int b = 0; b < 4; b++) w |= (u32)debug_read8(info.cpu, addr + b) << (b * 8);
+		r.stack.push_back(w);
+	}
+	hook_records.push_back(r);
+	if (hook_records.size() > HOOK_LOG_MAX) hook_records.pop_front();
+
+	if (h.action == HookConfig::BREAK) {
+		if (!hook_break_fn || !hook_break_fn(info.cpu, hook_names[info.event])) {
+			/* no debugger attached: pause at the end of the frame instead */
+			paused = true;
+		}
+	}
+}
+
+void hooks_update_enabled() {
+	for (int i = 0; i < DEBUG_HOOK_COUNT; i++)
+		debug_hooks_enabled[i] = hooks[i].action != HookConfig::OFF;
+	debug_hook_handler = hook_handler;
+}
+
+std::string hook_status_json() {
+	std::string arr = "[";
+	for (int i = 0; i < DEBUG_HOOK_COUNT; i++) {
+		const HookConfig &h = hooks[i];
+		if (i) arr += ",";
+		Json j;
+		j.str("event", hook_names[i])
+		 .str("action", h.action == HookConfig::OFF ? "off" : h.action == HookConfig::LOG ? "log" : "break")
+		 .num("hits", (s64)h.hits).num("stack", h.stack_words).num("frames_left", h.frames_left);
+		if (h.have_range) j.hex("min", h.min).hex("max", h.max);
+		arr += j.done();
+	}
+	arr += "]";
+	return Json().boolean("ok", true).raw("hooks", arr).num("records", hook_records.size())
+	             .num("last_seq", (s64)hook_seq).done();
+}
+
+/* ------------------------------------------------------------------ */
 /* command dispatch */
 
 std::string status_json(bool debugger_halted) {
@@ -753,6 +867,80 @@ std::string handle(int client_fd, const std::string &cmd, const Args &args, bool
 		return Json().boolean("ok", true).boolean("was_recording", was).str("path", path).num("frames", (s64)n).done();
 	}
 
+	if (cmd == "hook_set") {
+		std::string ev = arg_str(args, "event");
+		int idx = -1;
+		for (int i = 0; i < DEBUG_HOOK_COUNT; i++) if (ev == hook_names[i]) idx = i;
+		if (idx < 0) return error_reply("event must be card, dma, gx or swap");
+		HookConfig h;
+		std::string action = arg_str(args, "action", "log");
+		if (action == "off") h.action = HookConfig::OFF;
+		else if (action == "log") h.action = HookConfig::LOG;
+		else if (action == "break") h.action = HookConfig::BREAK;
+		else return error_reply("action must be log, break or off");
+		h.have_range = args.count("min") || args.count("max");
+		if (!arg_u32(args, "min", h.min, false, 0)) return error_reply("bad min");
+		if (!arg_u32(args, "max", h.max, false, 0xFFFFFFFF)) return error_reply("bad max");
+		if (!arg_u32(args, "stack", h.stack_words, false, idx == DEBUG_HOOK_GX ? 0 : 16) || h.stack_words > 256)
+			return error_reply("bad stack (0-256 words)");
+		if (!arg_u32(args, "frames", h.frames_left, false, 0)) return error_reply("bad frames");
+		std::string cmds = arg_str(args, "cmds");
+		if (!cmds.empty()) {
+			h.cmds.assign(256, false);
+			size_t start = 0;
+			while (start < cmds.size()) {
+				size_t comma = cmds.find(',', start);
+				std::string one = cmds.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+				u32 id;
+				if (!parse_u32(one, id) || id > 255) return error_reply("bad command id " + one);
+				h.cmds[id] = true;
+				if (comma == std::string::npos) break;
+				start = comma + 1;
+			}
+		}
+		h.hits = 0;
+		hooks[idx] = h;
+		hooks_update_enabled();
+		return hook_status_json();
+	}
+
+	if (cmd == "hook_status") return hook_status_json();
+
+	if (cmd == "hook_clear") {
+		size_t n = hook_records.size();
+		hook_records.clear();
+		return Json().boolean("ok", true).num("cleared", n).done();
+	}
+
+	if (cmd == "hook_log") {
+		u32 since, limit;
+		if (!arg_u32(args, "since", since, false, 0)) return error_reply("bad since");
+		if (!arg_u32(args, "limit", limit, false, 10000)) return error_reply("bad limit");
+		std::string out = "[";
+		u32 n = 0;
+		u64 last = since;
+		for (size_t i = 0; i < hook_records.size() && n < limit; i++) {
+			const HookRecord &r = hook_records[i];
+			if (r.seq <= since) continue;
+			char buf[256];
+			snprintf(buf, sizeof(buf), "%s[%llu,%u,%d,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,[",
+			         n ? "," : "", (unsigned long long)r.seq, r.event, r.frame, r.cpu, r.pc, r.lr, r.sp,
+			         r.thumb, r.args[0], r.args[1], r.args[2], r.args[3], r.dma_src);
+			out += buf;
+			for (size_t k = 0; k < r.stack.size(); k++) {
+				snprintf(buf, sizeof(buf), "%s%u", k ? "," : "", r.stack[k]);
+				out += buf;
+			}
+			out += "]]";
+			last = r.seq;
+			n++;
+		}
+		out += "]";
+		bool more = !hook_records.empty() && hook_records.back().seq > last;
+		return Json().boolean("ok", true).num("count", n).num("last_seq", (s64)last)
+		             .boolean("more", more).raw("records", out).done();
+	}
+
 	if (cmd == "dump") {
 		std::string dir = arg_str(args, "dir");
 		if (dir.empty()) return error_reply("missing dir");
@@ -891,6 +1079,10 @@ void ctl_poll(int timeout_ms, bool in_debugger_idle) {
 	}
 }
 
+void ctl_set_hook_break_fn(int (*fn)(int cpu, const char *name)) {
+	hook_break_fn = fn;
+}
+
 bool ctl_is_paused() {
 	return paused;
 }
@@ -931,6 +1123,15 @@ u16 ctl_pre_frame(u16 keypad) {
 
 void ctl_frame_done() {
 	frames_emulated++;
+
+	bool hooks_changed = false;
+	for (int i = 0; i < DEBUG_HOOK_COUNT; i++) {
+		if (hooks[i].action != HookConfig::OFF && hooks[i].frames_left && --hooks[i].frames_left == 0) {
+			hooks[i].action = HookConfig::OFF;
+			hooks_changed = true;
+		}
+	}
+	if (hooks_changed) hooks_update_enabled();
 
 	if (held_buttons && held_frames > 0 && --held_frames == 0) held_buttons = 0;
 	if (touch_active && touch_frames > 0 && --touch_frames == 0) touch_active = false;

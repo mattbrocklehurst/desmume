@@ -93,7 +93,7 @@ class LabelDB:
             return None
         e = self.labels[best]
         off = addr - best
-        if (e["size"] and off < e["size"]) or (not e["size"] and e["type"] == "func" and off < max_offset):
+        if (e["size"] and off < e["size"]) or (not e["size"] and off < max_offset):
             return f"{e['name']}+{off:#x}"
         return None
 

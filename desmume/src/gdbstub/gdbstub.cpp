@@ -26,6 +26,7 @@
 
 #include <errno.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <fcntl.h>
 
@@ -365,6 +366,37 @@ watch_stop_after_insn( void *data, UNUSED_PARM(uint32_t addr), UNUSED_PARM(int t
 }
 
 static void
+hook_stop_after_insn( void *data, UNUSED_PARM(uint32_t addr), UNUSED_PARM(int thumb)) {
+  struct gdb_stub_state *stub = (struct gdb_stub_state *)data;
+
+  stub->cpu_ctrl->stall( stub->cpu_ctrl->data);
+  stub->cpu_ctrl->remove_post_ex_fn( stub->cpu_ctrl->data);
+
+  stub->stop_pending = 1;
+  stub->stop_type = STOP_HOOK;
+  indicateCPUStop_gdb( stub);
+
+  NDS_debug_break();
+}
+
+int gdbstub_break_now( gdbstub_handle_t handle, const char *hook_name) {
+  struct gdb_stub_state *stub = (struct gdb_stub_state *)handle;
+
+  if ( stub == NULL || stub->sock_fd == -1 || stub->stop_pending ||
+       stub->ctl_stub_state == gdb_stub_state::STOPPED_GDB_STATE) {
+    return 0;
+  }
+
+  strncpy( stub->hook_name, hook_name, sizeof( stub->hook_name) - 1);
+  stub->hook_name[sizeof( stub->hook_name) - 1] = '\0';
+  stub->stop_pending = 1;
+  stub->cpu_ctrl->install_post_ex_fn( stub->cpu_ctrl->data,
+                                      hook_stop_after_insn,
+                                      stub);
+  return 1;
+}
+
+static void
 break_execution( void *data, UNUSED_PARM(uint32_t addr), UNUSED_PARM(int thunmb)) {
   struct gdb_stub_state *stub = (struct gdb_stub_state *)data;
 
@@ -381,6 +413,23 @@ break_execution( void *data, UNUSED_PARM(uint32_t addr), UNUSED_PARM(int thunmb)
   indicateCPUStop_gdb( stub);
 }
 
+
+/* Stop the CPU from the listener thread: after the current instruction when
+ * a frame is being emulated, or right away when the emulator is idle between
+ * frames (e.g. paused by the frontend), where no instruction would run. */
+static void
+request_break( struct gdb_stub_state *stub) {
+  gdbstub_mutex_lock();
+  if ( nds_exec_active) {
+    stub->cpu_ctrl->install_post_ex_fn( stub->cpu_ctrl->data,
+                                        break_execution,
+                                        stub);
+  }
+  else {
+    break_execution( stub, 0, 0);
+  }
+  gdbstub_mutex_unlock();
+}
 
 static void
 step_instruction_watch( void *data, uint32_t addr, UNUSED_PARM(int thunmb)) {
@@ -674,7 +723,7 @@ free_all_breakpoints_gdb( struct gdb_stub_state *stub) {
 
 static uint32_t
 make_stop_packet( uint8_t *ptr, enum stop_type type, uint32_t stop_address,
-                  uint32_t insn_address) {
+                  uint32_t insn_address, const char *hook_name) {
   uint32_t stop_size = 0;
   int watch_index = 0;
   const char watch_chars[] = { 'a', 'r' };
@@ -687,6 +736,14 @@ make_stop_packet( uint8_t *ptr, enum stop_type type, uint32_t stop_address,
     ptr[2] = hexchars[TARGET_SIGNAL_INT & 0xf];
     stop_size = 3;
     break;
+
+  case STOP_HOOK: {
+    /* non-standard field naming the event hook, ignored by gdb */
+    int n = snprintf( (char *)ptr, 64, "T%c%chook:%s;", hexchars[TARGET_SIGNAL_TRAP >> 4],
+                      hexchars[TARGET_SIGNAL_TRAP & 0xf], hook_name);
+    stop_size = n;
+    break;
+  }
 
   case STOP_STEP_BREAK:
   case STOP_BREAKPOINT:
@@ -760,7 +817,7 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
      * already executed: report the step as done without running */
     stub->swallow_step = 0;
     stub->stop_type = STOP_STEP_BREAK;
-    send_size = make_stop_packet( out_ptr, STOP_STEP_BREAK, 0, 0);
+    send_size = make_stop_packet( out_ptr, STOP_STEP_BREAK, 0, 0, "");
     gdbstub_mutex_unlock();
     return putpacket( sock, out_packet, send_size);
   }
@@ -778,7 +835,7 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
 
   case '?':
     send_size = make_stop_packet( out_ptr, stub->stop_type, stub->stop_address,
-                                 stub->stop_insn_address);
+                                 stub->stop_insn_address, stub->hook_name);
     /**ptr++ = 'S';
     *ptr++ = hexchars[stub->stop_reason >> 4];
     *ptr++ = hexchars[stub->stop_reason & 0xf];
@@ -1360,7 +1417,7 @@ WINAPI listenerThread_gdb( void *data) {
 	    state->main_stop_flag = 1;
 
             send_size = make_stop_packet( ptr, state->stop_type, state->stop_address,
-                                         state->stop_insn_address);
+                                         state->stop_insn_address, state->hook_name);
 
 	    /*ptr[0] = 'S';
 	    ptr[1] = hexchars[state->stop_reason >> 4];
@@ -1425,9 +1482,7 @@ WINAPI listenerThread_gdb( void *data) {
                * e.g. after a previous session detached */
               if ( state->ctl_stub_state != gdb_stub_state::STOPPED_GDB_STATE) {
                 state->silent_stop = 1;
-                state->cpu_ctrl->install_post_ex_fn( state->cpu_ctrl->data,
-                                                     break_execution,
-                                                     state);
+                request_break( state);
               }
             }
 
@@ -1464,10 +1519,7 @@ WINAPI listenerThread_gdb( void *data) {
                 /* this will cause the emulation to break the execution */
                 DEBUG_LOG( "Breaking execution\n");
 
-                /* install the post execution function */
-                state->cpu_ctrl->install_post_ex_fn( state->cpu_ctrl->data,
-                                                     break_execution,
-                                                     state);
+                request_break( state);
               }
               break;
             }
@@ -1744,6 +1796,7 @@ createStub_gdb( uint16_t port,
     stub->stop_insn_address = 0;
     stub->client_is_gdb = 0;
     stub->swallow_step = 0;
+    stub->hook_name[0] = '\0';
 
     if ( stub->listen_fd == -1) {
       LOG_ERROR( "Failed to create listening socket \"%s\"\n", strerror( errno));

@@ -365,6 +365,12 @@ static void desmume_cycle(struct ctrls_event_config * cfg)
 }
 
 #ifdef GDB_STUB
+static gdbstub_handle_t active_stubs[2];
+
+static int hook_break(int cpu, const char *name) {
+  return gdbstub_break_now(active_stubs[cpu ? 1 : 0], name);
+}
+
 static gdbstub_handle_t setup_gdb_stub(u16 port, armcpu_t *cpu, const armcpu_memory_iface *memio, const char* desc) {
 	gdbstub_handle_t stub = createStub_gdb(port, cpu, memio);
 	if ( stub == NULL) {
@@ -494,6 +500,9 @@ int main(int argc, char ** argv) {
 
   }
   ((CliDriver*)driver)->setStubs(stubs);
+  active_stubs[0] = stubs[0];
+  active_stubs[1] = stubs[1];
+  ctl_set_hook_break_fn(hook_break);
   gdbstub_wait_set_enabled(stubs[0], 1);
   gdbstub_wait_set_enabled(stubs[1], 1);
 
