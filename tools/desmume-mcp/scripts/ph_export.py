@@ -485,6 +485,66 @@ def repo_is_public(repo_dir):
         return None
 
 
+def package_and_push(out_dir, meta, game, version, args):
+    """tar.xz the export, encrypt it (unless --no-encrypt on a confirmed private repo) and,
+    with --push, commit it to args.dest_repo's current branch."""
+    archive = out_dir + ".tar.xz"
+    with tarfile.open(archive, "w:xz") as tar:
+        tar.add(out_dir, arcname=os.path.basename(out_dir))
+    log(f"archive {archive}: {os.path.getsize(archive) / 1e6:.1f} MB")
+
+    to_push = archive
+    passphrase = None
+    dest_repo = os.path.abspath(args.dest_repo)
+    public = repo_is_public(dest_repo)
+    if args.no_encrypt:
+        if public is not False:
+            sys.exit("--no-encrypt refused: GitHub does not confirm that this repository is private "
+                     "(the export contains the game's code)")
+    else:
+        passphrase = secrets.token_urlsafe(24)
+        enc = archive + ".enc"
+        env = dict(os.environ, PH_EXPORT_PASS=passphrase)
+        subprocess.run(["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "200000", "-salt",
+                        "-in", archive, "-out", enc, "-pass", "env:PH_EXPORT_PASS"], check=True, env=env)
+        with open(out_dir + ".passphrase", "w") as fh:
+            fh.write(passphrase + "\n")
+        to_push = enc
+
+    if passphrase:
+        log(f"passphrase saved to {out_dir}.passphrase")
+
+    if args.push:
+        # symbolic-ref also works on a fresh clone of an empty repository
+        branch = subprocess.run(["git", "-C", dest_repo, "symbolic-ref", "--short", "HEAD"], capture_output=True,
+                                text=True, check=True).stdout.strip()
+        dest_dir = os.path.join(dest_repo, "labelling")
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, os.path.basename(to_push))
+        shutil.copyfile(to_push, dest)
+        with open(os.path.join(dest_dir, f"{game}-export-{version}.json"), "w") as fh:
+            json.dump({k: v for k, v in meta.items() if k != "rom_sha1"} | {"file": os.path.basename(dest),
+                       "encrypted": passphrase is not None}, fh, indent=1)
+        subprocess.run(["git", "-C", dest_repo, "add", "labelling"], check=True)
+        subprocess.run(["git", "-C", dest_repo, "commit", "-q", "-m",
+                        f"labelling: {'encrypted ' if passphrase else ''}{game.upper()} {version} export for naming functions"],
+                       check=True)
+        # the branch may have moved on (e.g. results pushed from elsewhere): rebase once and retry
+        if subprocess.run(["git", "-C", dest_repo, "push", "-q", "origin", branch]).returncode != 0:
+            log(f"push rejected; pulling {branch} (rebase) and retrying ...")
+            subprocess.run(["git", "-C", dest_repo, "pull", "-q", "--rebase", "origin", branch], check=True)
+            subprocess.run(["git", "-C", dest_repo, "push", "-q", "origin", branch], check=True)
+        log(f"pushed {os.path.relpath(dest, dest_repo)} to {branch} in {dest_repo}")
+
+    print()
+    if passphrase:
+        print(f"Passphrase (paste this to Claude; it is also in {out_dir}.passphrase):\n\n    {passphrase}\n")
+    print(f"Export: {to_push}")
+    if not args.push:
+        print("Run again with --push to commit it to this repository's current branch.")
+
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -588,60 +648,7 @@ def main():
     log(f"disassembling into {out_dir} ...")
     write_export(out_dir, exp, modules, meta)
 
-    archive = out_dir + ".tar.xz"
-    with tarfile.open(archive, "w:xz") as tar:
-        tar.add(out_dir, arcname=os.path.basename(out_dir))
-    log(f"archive {archive}: {os.path.getsize(archive) / 1e6:.1f} MB")
-
-    to_push = archive
-    passphrase = None
-    dest_repo = os.path.abspath(args.dest_repo)
-    public = repo_is_public(dest_repo)
-    if args.no_encrypt:
-        if public is not False:
-            sys.exit("--no-encrypt refused: GitHub does not confirm that this repository is private "
-                     "(the export contains the game's code)")
-    else:
-        passphrase = secrets.token_urlsafe(24)
-        enc = archive + ".enc"
-        env = dict(os.environ, PH_EXPORT_PASS=passphrase)
-        subprocess.run(["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "200000", "-salt",
-                        "-in", archive, "-out", enc, "-pass", "env:PH_EXPORT_PASS"], check=True, env=env)
-        with open(out_dir + ".passphrase", "w") as fh:
-            fh.write(passphrase + "\n")
-        to_push = enc
-
-    if passphrase:
-        log(f"passphrase saved to {out_dir}.passphrase")
-
-    if args.push:
-        # symbolic-ref also works on a fresh clone of an empty repository
-        branch = subprocess.run(["git", "-C", dest_repo, "symbolic-ref", "--short", "HEAD"], capture_output=True,
-                                text=True, check=True).stdout.strip()
-        dest_dir = os.path.join(dest_repo, "labelling")
-        os.makedirs(dest_dir, exist_ok=True)
-        dest = os.path.join(dest_dir, os.path.basename(to_push))
-        shutil.copyfile(to_push, dest)
-        with open(os.path.join(dest_dir, f"{game}-export-{version}.json"), "w") as fh:
-            json.dump({k: v for k, v in meta.items() if k != "rom_sha1"} | {"file": os.path.basename(dest),
-                       "encrypted": passphrase is not None}, fh, indent=1)
-        subprocess.run(["git", "-C", dest_repo, "add", "labelling"], check=True)
-        subprocess.run(["git", "-C", dest_repo, "commit", "-q", "-m",
-                        f"labelling: {'encrypted ' if passphrase else ''}{game.upper()} {version} export for naming functions"],
-                       check=True)
-        # the branch may have moved on (e.g. results pushed from elsewhere): rebase once and retry
-        if subprocess.run(["git", "-C", dest_repo, "push", "-q", "origin", branch]).returncode != 0:
-            log(f"push rejected; pulling {branch} (rebase) and retrying ...")
-            subprocess.run(["git", "-C", dest_repo, "pull", "-q", "--rebase", "origin", branch], check=True)
-            subprocess.run(["git", "-C", dest_repo, "push", "-q", "origin", branch], check=True)
-        log(f"pushed {os.path.relpath(dest, dest_repo)} to {branch} in {dest_repo}")
-
-    print()
-    if passphrase:
-        print(f"Passphrase (paste this to Claude; it is also in {out_dir}.passphrase):\n\n    {passphrase}\n")
-    print(f"Export: {to_push}")
-    if not args.push:
-        print("Run again with --push to commit it to this repository's current branch.")
+    package_and_push(out_dir, meta, game, version, args)
 
 
 if __name__ == "__main__":
