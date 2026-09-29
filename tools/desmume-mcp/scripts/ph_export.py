@@ -80,7 +80,7 @@ GAMES = {
            "codes": {"BKIE": "usa", "BKIP": "eur", "BKIJ": "jp"}},
     # one config for one (unstated) version; the call relocation check decides
     "sm64ds": {"title": "Super Mario 64 DS", "url": "https://github.com/tangosdev/sm64ds-decomp",
-               "codes": {"AMCE": "usa", "AMCP": "eur", "AMCJ": "jp", "AMCK": "kr"}, "flat_config": True},
+               "codes": {"ASME": "usa", "ASMP": "eur", "ASMJ": "jp", "ASMK": "kr"}, "flat_config": True},
 }
 
 
@@ -611,6 +611,9 @@ def main():
             fh.write(passphrase + "\n")
         to_push = enc
 
+    if passphrase:
+        log(f"passphrase saved to {out_dir}.passphrase")
+
     if args.push:
         # symbolic-ref also works on a fresh clone of an empty repository
         branch = subprocess.run(["git", "-C", dest_repo, "symbolic-ref", "--short", "HEAD"], capture_output=True,
@@ -626,7 +629,11 @@ def main():
         subprocess.run(["git", "-C", dest_repo, "commit", "-q", "-m",
                         f"labelling: {'encrypted ' if passphrase else ''}{game.upper()} {version} export for naming functions"],
                        check=True)
-        subprocess.run(["git", "-C", dest_repo, "push", "-q", "origin", branch], check=True)
+        # the branch may have moved on (e.g. results pushed from elsewhere): rebase once and retry
+        if subprocess.run(["git", "-C", dest_repo, "push", "-q", "origin", branch]).returncode != 0:
+            log(f"push rejected; pulling {branch} (rebase) and retrying ...")
+            subprocess.run(["git", "-C", dest_repo, "pull", "-q", "--rebase", "origin", branch], check=True)
+            subprocess.run(["git", "-C", dest_repo, "push", "-q", "origin", branch], check=True)
         log(f"pushed {os.path.relpath(dest, dest_repo)} to {branch} in {dest_repo}")
 
     print()
