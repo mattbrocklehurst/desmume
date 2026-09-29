@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Export an annotated disassembly of a zeldaret DS decomp's game for labelling:
-The Legend of Zelda: Phantom Hourglass (--game ph, default) or Spirit Tracks
-(--game st).
+"""Export an annotated disassembly of a DS decomp's game for labelling:
+The Legend of Zelda: Phantom Hourglass (--game ph, default), Spirit Tracks
+(--game st) or Super Mario 64 DS (--game sm64ds).
 
-Takes your own ROM dump and the decompilation's (zeldaret/ph or zeldaret/st) symbol tables
-(config/<version>/arm9) and writes, for every function of the main binary,
+Takes your own ROM dump and the decompilation's (zeldaret/ph, zeldaret/st,
+tangosdev/sm64ds-decomp) symbol tables (config/<version>/arm9, or config/arm9
+for sm64ds) and writes, for every function of the main binary,
 ITCM and all overlays: its code with calls, pointers and literal pool values
 resolved to symbol names, I/O register names and referenced strings, plus
 an index with callers/callees. That is what is needed to propose names for
@@ -77,6 +78,9 @@ GAMES = {
            "codes": {"AZEE": "usa", "AZEP": "eur"}},
     "st": {"title": "Spirit Tracks", "url": "https://github.com/zeldaret/st",
            "codes": {"BKIE": "usa", "BKIP": "eur", "BKIJ": "jp"}},
+    # one config for one (unstated) version; the call relocation check decides
+    "sm64ds": {"title": "Super Mario 64 DS", "url": "https://github.com/tangosdev/sm64ds-decomp",
+               "codes": {"AMCE": "usa", "AMCP": "eur", "AMCJ": "jp", "AMCK": "kr"}, "flat_config": True},
 }
 
 
@@ -485,9 +489,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("rom")
-    ap.add_argument("--game", choices=sorted(GAMES), default="ph", help="ph (default) or st")
+    ap.add_argument("--game", choices=sorted(GAMES), default="ph", help="ph (default), st or sm64ds")
     ap.add_argument("--decomp", "--ph", dest="decomp",
-                    help="path to the zeldaret/<game> checkout (default: clone into ~/.cache)")
+                    help="path to the decomp checkout (default: clone into ~/.cache)")
     ap.add_argument("--version", help="usa, eur, eur1, jp... (default: detected from the ROM)")
     ap.add_argument("--out", default=None, help="output directory (default: ./<game>-export-<version>)")
     ap.add_argument("--push", action="store_true", help="commit the encrypted export to a repo's current branch and push")
@@ -515,12 +519,15 @@ def main():
     game = args.game
     ph = get_decomp(args.decomp, game)
     version, sha1, exact = detect_version(ph, game, rom_bytes, rom, args.version)
+    if not version and GAMES[game].get("flat_config"):
+        version = rom.game_code.lower()          # only names the output; verification decides
     if not version:
         sys.exit(f"cannot tell the ROM version (game code {rom.game_code}); pass --version "
                  f"(one of {', '.join(sorted(os.listdir(os.path.join(ph, 'config'))))}), or check --game")
     log(f"ROM {rom.title} [{rom.game_code}] sha1 {sha1}: {version}"
-        + ("" if exact else " (sha1 does not match the decomp's reference dump; verifying against the code)"))
-    cfg = os.path.join(ph, "config", version, "arm9")
+        + ("" if exact else " (not the decomp's reference dump, or it has none; verifying against the code)"))
+    flat = GAMES[game].get("flat_config")
+    cfg = os.path.join(ph, "config", "arm9") if flat else os.path.join(ph, "config", version, "arm9")
     if not os.path.isdir(cfg):
         sys.exit(f"{cfg} not found")
 
