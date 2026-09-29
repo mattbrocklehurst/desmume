@@ -846,6 +846,26 @@ std::string handle(int client_fd, const std::string &cmd, const Args &args, bool
 		return Json().boolean("ok", true).done();
 	}
 
+	if (cmd == "backup_import") {
+		/* load a battery save (.sav raw / no$gba / .dsv) into the cartridge backup
+		   memory, then reset so the game boots with it */
+		std::string path = arg_str(args, "path");
+		u32 size;
+		if (path.empty()) return error_reply("missing path");
+		if (!arg_u32(args, "size", size, false, 0)) return error_reply("bad size");
+		if (debugger_halted) return error_reply("CPU is halted by the debugger, continue or detach it first");
+		if (!MMU_new.backupDevice.importData(path.c_str(), size)) return error_reply("importing the save failed");
+		NDS_Reset();
+		return Json().boolean("ok", true).str("path", path).done();
+	}
+
+	if (cmd == "backup_export") {
+		std::string path = arg_str(args, "path");
+		if (path.empty()) return error_reply("missing path");
+		if (!MMU_new.backupDevice.exportData(path.c_str())) return error_reply("exporting the save failed");
+		return Json().boolean("ok", true).str("path", path).done();
+	}
+
 	if (cmd == "quit") {
 		quit_requested = true;
 		execute = false; /* also leaves the debugger idle loop */

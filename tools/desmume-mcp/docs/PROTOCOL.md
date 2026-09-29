@@ -57,6 +57,8 @@ merged with the keyboard/joystick in the window.
 | `savestate_save path=FILE` / `savestate_load path=FILE` | (load is refused while the debugger holds the CPU mid-frame) |
 | `movie_record path=F.dsm [from=now\|reset]` / `movie_play path=F.dsm` / `movie_stop` | DeSmuME input movies |
 | `video_record path=F.mp4` / `video_stop` | via `ffmpeg` in PATH |
+| `backup_import path=FILE [size=N]` | load a battery save (raw `.sav`, no$gba or `.dsv`) into the cartridge backup memory and reset, so the game boots with it (no need to place files in DeSmuME's battery folder) |
+| `backup_export path=FILE` | write the current backup memory to a file (raw) |
 | `dump dir=DIR [note=TEXT]` | freeze: pause and write RAM/VRAM/IO/registers/screenshot/savestate + `manifest.json` |
 
 ## Event hooks
