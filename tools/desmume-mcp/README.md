@@ -27,6 +27,7 @@ Contents:
 - [Connecting Claude](#connecting-claude)
 - [What you can do](#what-you-can-do) (workflows)
 - [Oracle testing](docs/ORACLE.md) (separate document)
+- [Reverse-engineering workflow](docs/REVERSING.md): exports, cross-game matching, RAM/heap analysis, naming, text extraction
 - [Tool reference](docs/TOOLS.md) (generated)
 - [Control protocol](docs/PROTOCOL.md) (for scripting without Python)
 - [Data directory](#data-directory), [Tests](#tests), [Limitations](#limitations)
