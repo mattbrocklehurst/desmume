@@ -260,6 +260,26 @@ sequences of timed paragraphs (commands); a JFVB block holds the animation
 curves (constant, list_parameter, hermite on DS). Lossless: the JSON rebuilds
 the files byte for byte.
 
+### Sound (NitroSDK SDAT)
+
+```sh
+reversing/sdat.py --rom rom.nds --out sound/ --extract --wav   # listing + every file; streams and
+                                                               # wave archives decoded to .wav
+reversing/sseq.py --sdat-dir sound/ --out seq/ --midi          # sequences -> JSON events + .mid
+```
+
+`sdat.py` lists every sequence, sequence archive (sound effects), bank, wave
+archive, player, group and stream with its INFO fields (bank, volume,
+priorities, player), using the SYMB names when the archive has them (PH and ST
+strip them: sounds are known by index, so the game-side tables naming them come
+from the code). `--wav` decodes STRM and SWAV data (PCM8, PCM16, IMA-ADPCM) and
+writes the loop start as a WAV `smpl` chunk. `sseq.py` decodes the sequence
+bytecode (48 ticks per quarter note; notes, rests, tracks, jumps, calls, loops,
+variables and the random/variable/if prefixes) losslessly to JSON, and writes
+a MIDI rendition (volume, pan, expression, bend, program, tempo; loop points
+as markers). Instrument mapping needs the SBNK banks, which point into the
+wave archives.
+
 ## Order, for a new game
 
 1. `rom_vault.py push` (once), `rom_inventory.py`.
