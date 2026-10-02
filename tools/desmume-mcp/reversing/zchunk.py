@@ -35,31 +35,49 @@ import os
 import struct
 import sys
 
-# (tag, entry size) -> fields. "fx32" = 20.12 fixed point, written as a float.
-SCHEMA = {
-    ("VTXB", 12): [("x", "fx32"), ("y", "fx32"), ("z", "fx32")],
-    ("NRMB", 6): [("nx", "h"), ("ny", "h"), ("nz", "h")],
-    ("PCLB", 4): [("attr", "I")],
-    ("TRIB", 8): [("v0", "H"), ("v1", "H"), ("v2", "H"), ("attr", "H")],
-}
+# Field layouts: zchunk_schema.json beside this file, {"KEY": [[name, code], ...]}.
+# KEY is TAG/ENTRYSIZE, optionally qualified by game and/or container version:
+#   "ph:ROOM/20", "ARAB/12@ZMB2", "st:WARP/24@ZMB1"; the most specific match wins.
+# Codes: fx32 (20.12 fixed point, written as a float), b B h H i I (struct),
+# 4cc (u32 FourCC), s16 (16-byte NUL-padded string).
+SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zchunk_schema.json")
+SCHEMA = json.load(open(SCHEMA_PATH)) if os.path.exists(SCHEMA_PATH) else {}
 
 CODES = {"fx32": ("i", 4), "b": ("b", 1), "B": ("B", 1), "h": ("h", 2), "H": ("H", 2), "i": ("i", 4), "I": ("I", 4),
-         "4cc": ("4s", 4)}
+         "4cc": ("4s", 4), "s16": ("16s", 16)}
+GAMES = {"AZE": "ph", "BKI": "st"}     # ROM game code prefix -> schema game key
+
+
+def schema_for(tag, size, game=None, version=None):
+    keys = []
+    for g in ([game] if game else []) + [None]:
+        for v in ([version] if version else []) + [None]:
+            keys.append((f"{g}:" if g else "") + f"{tag}/{size}" + (f"@{v}" if v else ""))
+    for k in keys:
+        if k in SCHEMA:
+            return SCHEMA[k]
+    return None
 
 
 def fourcc(b):
     return b[::-1].decode("latin-1")
 
 
-def decode_entry(tag, e):
-    fields = SCHEMA.get((tag, len(e)))
+def decode_entry(tag, e, game=None, version=None):
+    fields = schema_for(tag, len(e), game, version)
     out = {}
     if fields:
         pos = 0
         for name, code in fields:
             fmt, n = CODES[code]
             v = struct.unpack_from("<" + fmt, e, pos)[0]
-            out[name] = v / 4096 if code == "fx32" else fourcc(v) if code == "4cc" else v
+            if code == "fx32":
+                v /= 4096
+            elif code == "4cc":
+                v = fourcc(v)
+            elif code == "s16":
+                v = v.split(b"\0")[0].decode("latin-1")
+            out[name] = v
             pos += n
         if pos < len(e):
             out["rest"] = e[pos:].hex()
@@ -72,9 +90,20 @@ def decode_entry(tag, e):
     return out
 
 
-def section(tag, body):
+def section(tag, body, game=None, version=None):
     """body = section bytes after the 8-byte tag/size header."""
     s = {"tag": tag, "size": len(body) + 8}
+    if tag == "ROMB" and len(body) >= 4:
+        # tile grid: u16 width, u16 height, then width*height cells of 4 bytes
+        # [misc, type, height (s8, steps of 1.2), flags], one row (constant z) after another
+        w, h = struct.unpack_from("<HH", body, 0)
+        s.update(width=w, height=h, cell_fields=["misc", "type", "height", "flags"])
+        if w and h and len(body) - 4 == w * h * 4:
+            s["rows"] = [[[body[o], body[o + 1], struct.unpack_from("b", body, o + 2)[0], body[o + 3]]
+                          for o in range(4 + z * w * 4, 4 + (z + 1) * w * 4, 4)] for z in range(h)]
+        else:
+            s["raw"] = body[4:].hex()
+        return s
     if len(body) < 4:
         s["raw"] = body.hex()
         return s
@@ -84,7 +113,7 @@ def section(tag, body):
     if count and len(data) % count == 0:
         esz = len(data) // count
         s["entry_size"] = esz
-        s["entries"] = [decode_entry(tag, data[i * esz:(i + 1) * esz]) for i in range(count)]
+        s["entries"] = [decode_entry(tag, data[i * esz:(i + 1) * esz], game, version) for i in range(count)]
     elif count == 0 and not data:
         s["entries"] = []
     else:
@@ -92,7 +121,8 @@ def section(tag, body):
     return s
 
 
-def parse(d):
+def parse(d, game=None):
+    """game: "ph"/"st" (selects game-specific layouts) or None."""
     head = d[:4]
     if fourcc(head) in ("MAPB", "MCLB") or d[16:32] == b"\x04\x03\x02\x01" * 4:   # any container of this family
         size, n = struct.unpack_from("<II", d, 8)
@@ -114,7 +144,7 @@ def parse(d):
         raise ValueError(f"unknown container {head!r}")
     for _ in range(n):
         tag, ssz = fourcc(d[pos:pos + 4]), struct.unpack_from("<I", d, pos + 4)[0]
-        out["sections"].append(section(tag, d[pos + 8:pos + ssz]))
+        out["sections"].append(section(tag, d[pos + 8:pos + ssz], game, out.get("version")))
         if ssz < 8:
             break
         pos += ssz
@@ -129,6 +159,7 @@ def rom_items(rom_path, prefix):
     from desmume_mcp.rom import Rom
     import rom_inventory as ri
     rom = Rom(rom_path)
+    game = GAMES.get(rom.game_code[:3])
     for fid, path in sorted(rom.files.items(), key=lambda x: x[1]):
         if not path.startswith(prefix):
             continue
@@ -136,7 +167,7 @@ def rom_items(rom_path, prefix):
         members = ri.narc_members(plain) if fmt == "NARC" else [(None, plain)]
         for name, md in members:
             _, _, _, mp = ri.classify(md)
-            yield (path if name is None else f"{path}/{name}"), mp
+            yield (path if name is None else f"{path}/{name}"), mp, game
 
 
 def main():
@@ -146,13 +177,14 @@ def main():
     ap.add_argument("--rom")
     ap.add_argument("--prefix", default="")
     ap.add_argument("--out")
+    ap.add_argument("--game", help="ph or st: game-specific layouts (taken from the ROM header with --rom)")
     args = ap.parse_args()
     items = list(rom_items(args.rom, args.prefix)) if args.rom else []
-    items += [(f, open(f, "rb").read()) for f in args.files]
+    items += [(f, open(f, "rb").read(), args.game) for f in args.files]
     n = 0
-    for path, d in items:
+    for path, d, game in items:
         try:
-            m = parse(d)
+            m = parse(d, game or args.game)
         except (ValueError, struct.error):
             continue
         n += 1
