@@ -69,7 +69,7 @@ end 32                     # the run lasts 32 frames
 Play it yourself, in a window:
 
 ```sh
-desmume-oracle record zelda.nds dungeon1.inputs --state before-dungeon1.dst
+desmume-oracle record game.nds dungeon1.inputs --state before-dungeon1.dst
 ```
 
 The game starts from the state (or power on), everything you press is
@@ -89,11 +89,11 @@ the `.inputs` format is what the oracle tools and your engine share.
 
 ```sh
 # replay and sample values every frame (labels from a symbol file or labels json)
-desmume-oracle replay zelda.nds dungeon1.inputs --labels zelda-labels.json \
+desmume-oracle replay game.nds dungeon1.inputs --labels game-labels.json \
     --sample link_x:s32:link_pos --sample link_y:s32:link_pos+4 --out trace.json
 
 # determinism check
-desmume-oracle replay zelda.nds dungeon1.inputs --check
+desmume-oracle replay game.nds dungeon1.inputs --check
 ```
 
 The JSON output has the per-frame series and a CRC of main RAM at the end,
@@ -139,7 +139,7 @@ screenshot end.png
 Addresses are numbers, hex, labels or `label+offset` (from `--labels`).
 
 ```sh
-desmume-oracle run zelda.nds tests/walk.oracle --labels zelda-labels.json --out walk.json
+desmume-oracle run game.nds tests/walk.oracle --labels game-labels.json --out walk.json
 echo $?    # 0 passed, 1 an expectation failed, 2 error
 ```
 
@@ -155,7 +155,7 @@ The bundled example: `testgame/tests/movement.oracle`.
 ```python
 from desmume_mcp.oracle import Oracle, InputScript
 
-with Oracle("zelda.nds", labels="zelda-labels.json", jit=True) as o:
+with Oracle("game.nds", labels="game-labels.json", jit=True) as o:
     o.load("before-dungeon1.dst")
     o.press("left", 5)                      # hold 5 frames, release
     o.hold(["b", "up"]); o.advance(10); o.release()

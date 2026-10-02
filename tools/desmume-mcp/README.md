@@ -27,7 +27,6 @@ Contents:
 - [Connecting Claude](#connecting-claude)
 - [What you can do](#what-you-can-do) (workflows)
 - [Oracle testing](docs/ORACLE.md) (separate document)
-- [Reverse-engineering workflow](docs/REVERSING.md): exports, cross-game matching, RAM/heap analysis, naming, text extraction
 - [Tool reference](docs/TOOLS.md) (generated)
 - [Control protocol](docs/PROTOCOL.md) (for scripting without Python)
 - [Data directory](#data-directory), [Tests](#tests), [Limitations](#limitations)
@@ -77,7 +76,7 @@ Other clients: run `desmume-mcp` (stdio transport). For example in a
 { "mcpServers": { "desmume": { "command": "desmume-mcp" } } }
 ```
 
-Then ask for things like *"start zelda.nds and find where Link's position is
+Then ask for things like *"start game.nds and find where the player's position is
 stored"*. The server gives the agent an overview of the workflows; the full
 list is in [docs/TOOLS.md](docs/TOOLS.md).
 
