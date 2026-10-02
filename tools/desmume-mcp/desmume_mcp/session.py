@@ -11,6 +11,11 @@ import struct
 import subprocess
 import time
 
+import atexit
+import signal
+import sys
+import weakref
+
 from .control import ControlClient, ControlError
 from .gdbrsp import GdbClient, GdbError, SIGINT
 from .hw import io_name
@@ -22,6 +27,30 @@ from .rom import Rom
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 REG_NAMES = [f"r{i}" for i in range(13)] + ["sp", "lr", "pc"]
+
+
+def _die_with_parent():
+    """In the child, before exec: have Linux send SIGTERM when the Python process dies, so an
+    emulator is never left running after its owner crashed or was killed (no-op elsewhere)."""
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)   # PR_SET_PDEATHSIG
+        except Exception:
+            pass
+
+
+_live_sessions = weakref.WeakSet()
+
+
+@atexit.register
+def _stop_live_sessions():
+    for sess in list(_live_sessions):
+        try:
+            if sess.proc and sess.proc.poll() is None:
+                sess.proc.terminate()
+        except Exception:
+            pass
 
 
 class SessionError(RuntimeError):
@@ -203,7 +232,8 @@ class Session:
         self.log_path = os.path.join(self.data_dir, "logs", time.strftime("%Y%m%d-%H%M%S") + ".log")
         log = open(self.log_path, "wb")
         self.proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                     env=env, start_new_session=True)
+                                     env=env, start_new_session=True, preexec_fn=_die_with_parent)
+        _live_sessions.add(self)
 
         deadline = time.time() + timeout
         while True:
