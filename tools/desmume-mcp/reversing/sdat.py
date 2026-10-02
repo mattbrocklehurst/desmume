@@ -30,7 +30,8 @@ usage:
   sdat.py FILE.sdat [--out DIR] [--extract [--wav]]   listing to DIR/sdat.json (stdout without
                                                --out); --extract also writes every file, by name;
                                                --wav decodes STRM and SWAR (PCM8/16, IMA-ADPCM) to
-                                               .wav (loop start as a 'smpl' chunk)
+                                               .wav (loop start as a 'smpl' chunk); banks are
+                                               decoded to .json instrument tables
   sdat.py --rom game.nds [--out DIR] [--extract]   every SDAT in the ROM
 """
 
@@ -210,6 +211,46 @@ def swar_to_wavs(b):
     return out
 
 
+def sbnk(b):
+    """Instrument bank -> list of instruments (None = empty program).
+    Each instrument: {"type": "pcm"|"psg"|"noise"|"drums"|"split", "regions": [...]}; a region is
+    {"keys": [lo, hi], "swav": wave index, "swar": slot 0-3 in the bank's wave archive list (for
+    pcm; for psg the duty cycle), "base_key", "attack", "decay", "sustain", "release", "pan"}."""
+    da = b.index(b"DATA")
+    n = struct.unpack_from("<I", b, da + 0x28)[0]
+
+    def note(o, lo, hi):
+        sw, sa, base, a, dc, su, r, pan = struct.unpack_from("<HHBBBBBB", b, o)
+        return {"keys": [lo, hi], "swav": sw, "swar": sa, "base_key": base, "attack": a, "decay": dc,
+                "sustain": su, "release": r, "pan": pan}
+    out = []
+    for i in range(n):
+        kind, off = struct.unpack_from("<BH", b, da + 0x2C + 4 * i)
+        if kind == 0:
+            out.append(None)
+        elif kind in (1, 2, 3, 4, 5):
+            out.append({"type": {1: "pcm", 2: "psg", 3: "noise"}.get(kind, f"type{kind}"),
+                        "regions": [dict(note(off, 0, 127), kind=kind)]})
+        elif kind == 16:
+            lo, hi = b[off], b[off + 1]
+            regs = []
+            for k in range(hi - lo + 1):
+                o = off + 2 + 12 * k
+                regs.append(dict(note(o + 2, lo + k, lo + k), kind=b[o]))
+            out.append({"type": "drums", "regions": regs})
+        elif kind == 17:
+            splits = [x for x in b[off:off + 8] if x]
+            regs, lo = [], 0
+            for k, hi in enumerate(splits):
+                o = off + 8 + 12 * k
+                regs.append(dict(note(o + 2, lo, hi), kind=b[o]))
+                lo = hi + 1
+            out.append({"type": "split", "regions": regs})
+        else:
+            out.append({"type": f"unknown{kind}", "offset": off})
+    return out
+
+
 def extract(d, listing, fat, out_dir, wav=False):
     named = {}
     for r in ("seq", "seqarc", "bank", "wavearc", "strm"):
@@ -223,6 +264,8 @@ def extract(d, listing, fat, out_dir, wav=False):
         path = os.path.join(out_dir, rel + "." + EXT.get(blob[:4], "bin"))
         os.makedirs(os.path.dirname(path), exist_ok=True)
         open(path, "wb").write(blob)
+        if blob[:4] == b"SBNK":
+            json.dump(sbnk(blob), open(path[:-5] + ".json", "w"), separators=(",", ":"))
         if wav and blob[:4] == b"STRM":
             open(path[:-5] + ".wav", "wb").write(strm_to_wav(blob))
         elif wav and blob[:4] == b"SWAR":
