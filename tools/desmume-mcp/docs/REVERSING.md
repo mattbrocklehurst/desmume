@@ -71,6 +71,10 @@ Export format, one function:
 ...: bl #0x2001234  -> OS_GetTick
 ```
 
+A call from main into an address range shared by several overlays (whichever
+is loaded at the time) names every candidate: `-> func_ov017_x | func_ov018_x`;
+tools reading the first token after `->` get the first candidate.
+
 ## 3. Matching functions between games (no fuzzy matching)
 
 ```sh

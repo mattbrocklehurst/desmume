@@ -267,17 +267,27 @@ class Exporter:
         self.callees = collections.defaultdict(set)
 
     def resolve(self, addr, mods, prefer=None):
-        """Symbol name for addr in one of the given modules."""
+        """Symbol name for addr in one of the given modules.
+
+        A reloc may name several overlays sharing an address range (a call from
+        main into whichever of them is loaded). The caller's own module wins;
+        otherwise every module with a symbol exactly at addr is named
+        ("a | b": tools reading the first token get the first), and only when none has one, the first 'sym+off' match."""
         order = list(mods)
         if prefer and prefer in order:
             order.remove(prefer)
             order.insert(0, prefer)
-        for name in order:
-            m = self.modules.get(name)
-            if m:
-                s = m.symbol_for(addr)
-                if s:
-                    return s, name
+        loaded = [(n, self.modules[n]) for n in order if n in self.modules]
+        exact = [(n, m.by_addr.get(addr) or m.by_addr.get(addr & ~1)) for n, m in loaded]
+        exact = [(n, s["name"]) for n, s in exact if s]
+        if exact:
+            if exact[0][0] == prefer or len(exact) == 1:
+                return exact[0][1], exact[0][0]
+            return " | ".join(name for _, name in exact), exact[0][0]
+        for name, m in loaded:
+            s = m.symbol_for(addr)
+            if s:
+                return s, name
         return None, None
 
     def modules_for(self, addr, home):
@@ -302,13 +312,16 @@ class Exporter:
                 if kind not in CALL_KINDS:
                     continue
                 caller = m.func_containing(frm)
-                for tm in mods:
-                    t = self.modules.get(tm)
-                    if t and t.by_addr.get(to & ~1) and t.by_addr[to & ~1]["kind"] == "function":
-                        if caller:
-                            self.callers[(tm, to & ~1)].add((m.name, caller["addr"]))
-                            self.callees[(m.name, caller["addr"])].add((tm, to & ~1))
-                        break
+                if not caller:
+                    continue
+                # every overlay that may be loaded there gets the edge; the caller's own module wins
+                targets = [tm for tm in mods if self.modules.get(tm) and self.modules[tm].by_addr.get(to & ~1)
+                           and self.modules[tm].by_addr[to & ~1]["kind"] == "function"]
+                if m.name in targets:
+                    targets = [m.name]
+                for tm in targets:
+                    self.callers[(tm, to & ~1)].add((m.name, caller["addr"]))
+                    self.callees[(m.name, caller["addr"])].add((tm, to & ~1))
 
     def func_name(self, key):
         m = self.modules.get(key[0])
