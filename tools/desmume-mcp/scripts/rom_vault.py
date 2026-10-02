@@ -77,7 +77,8 @@ def push(args):
         have = subprocess.run(["git", "-C", repo, "ls-remote", "--exit-code", "--heads", "origin", args.branch],
                               capture_output=True).returncode == 0
         if have:
-            run("git", "-C", repo, "fetch", "-q", "origin", args.branch)
+            run("git", "-C", repo, "fetch", "-q", "origin",
+                f"+refs/heads/{args.branch}:refs/remotes/origin/{args.branch}")
             run("git", "-C", repo, "worktree", "add", "-q", "-B", args.branch, wt, f"origin/{args.branch}")
         else:
             run("git", "-C", repo, "worktree", "add", "-q", "--orphan", "-b", args.branch, wt)
@@ -123,15 +124,20 @@ def push(args):
 
 def fetch(args):
     repo = os.path.abspath(args.repo)
-    run("git", "-C", repo, "fetch", "-q", "origin", args.branch)
+    # explicit refspec: clones made with --single-branch have no fetch refspec for other branches
+    run("git", "-C", repo, "fetch", "-q", "origin", f"+refs/heads/{args.branch}:refs/remotes/origin/{args.branch}")
     out = os.path.abspath(args.out)
     os.makedirs(out, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
         run("git", "-C", repo, "worktree", "add", "-q", "--detach", os.path.join(tmp, "wt"), f"origin/{args.branch}")
         try:
             vault = os.path.join(tmp, "wt", "roms")
-            manifest = json.load(open(os.path.join(vault, "manifest.json")))
+            # a branch pushed by hand (tar | openssl | split -b 45M) has no manifest: no SHA-1 check then
+            mpath = os.path.join(vault, "manifest.json")
+            manifest = json.load(open(mpath)) if os.path.exists(mpath) else None
             parts = sorted(glob.glob(os.path.join(vault, "roms.tar.xz.enc.part-*")))
+            if not parts:
+                sys.exit(f"no roms.tar.xz.enc.part-* files on branch {args.branch}")
             pw = passphrase(confirm=False)
             cat = subprocess.Popen(["cat", *parts], stdout=subprocess.PIPE)
             dec = subprocess.Popen(["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "200000",
@@ -144,6 +150,9 @@ def fetch(args):
                 sys.exit("decrypt/extract failed (wrong passphrase?)")
         finally:
             subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", os.path.join(tmp, "wt")])
+    if manifest is None:
+        print("no manifest; extracted:", ", ".join(sorted(os.listdir(out))))
+        return
     for m in manifest["roms"]:
         p = os.path.join(out, m["file"])
         ok = os.path.exists(p) and sha1(p) == m["sha1"]
