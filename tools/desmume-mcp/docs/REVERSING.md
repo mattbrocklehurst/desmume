@@ -223,6 +223,43 @@ print(c.most_common())
 EOF
 ```
 
+### Maps, collision, course lists (Zelda DS)
+
+```sh
+reversing/zchunk.py --rom rom.nds --prefix Map/ --out maps/     # every container, through NARC/LZ77
+reversing/zchunk.py file.zmb --game ph                          # single file to stdout
+```
+
+One parser for the family of chunked containers: `.zmb` MAPB (map), `.zcb`
+MCLB (collision), `.zab` ZCAB (course arrangement), `.zob` ZOLB (preload
+lists), `.ilb` ZILB, `.clb`/`.cib` course lists, ST `.ztb` MTRB. FourCCs are
+stored as little-endian u32 (they read backwards in a hex dump). Field layouts
+are data, in `reversing/zchunk_schema.json`, keyed `TAG/ENTRYSIZE` and
+optionally `game:` / `@VERSION`; entries with no layout come out as hex words,
+so nothing is lost. Variable-length sections are decoded in code: ROMB tile
+grid, GRDB collision lookup grid (x-major cells of triangle lists), RALB rails.
+
+How the layouts were found, so it can be repeated for another game: the
+section tags appear in code as u32 constants (`'PLYR'` = 0x504c5952), so a
+grep of the export finds the loader that switches on them; each case calls a
+per-section handler, and following where the handler stores each field and
+who reads it gives the meaning. Generic rule of the format: table sections
+are `u16 count, u16 word` + fixed entries, so `(size - 12) / count` gives the
+entry size across all files (`survey` it first).
+
+### Cutscenes (JStudio STB)
+
+```sh
+reversing/stb.py --rom rom.nds --out cutscenes/      # or FILE.stb ... ; --stats for coverage
+```
+
+Nintendo JSystem JStudio, as in Twilight Princess (whose decomp has the
+source: the reference used here), little-endian with fx32 instead of floats.
+Object blocks (actor, camera, particle, sound, message, control) carry
+sequences of timed paragraphs (commands); a JFVB block holds the animation
+curves (constant, list_parameter, hermite on DS). Lossless: the JSON rebuilds
+the files byte for byte.
+
 ## Order, for a new game
 
 1. `rom_vault.py push` (once), `rom_inventory.py`.
