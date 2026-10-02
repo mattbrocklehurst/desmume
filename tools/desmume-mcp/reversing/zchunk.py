@@ -8,6 +8,8 @@ they read backwards in a hex dump: "BPAM" on disk is MAPB):
   .zcb  MCLB/ZCB1        collision: vertices, triangles, attributes, lookup grid
   .zab  ZCAB             course arrangement (forward magic), sections CABM, CABI
   .zob  ZOLB             object/actor type lists (forward magic)
+  .ilb  ZILB             (PH) sea chart islands, like ZCAB: sections CIBI, CIBS, CIBC
+  .clb  ZCLB, .cib ZCIB  course lists: size-prefixed records (+ room tables)
   .ztb  MTRB/ZTB1        (ST) train track network
   and any other file with the same 0x20-byte header (01020304 padding)
 
@@ -63,25 +65,29 @@ def fourcc(b):
     return b[::-1].decode("latin-1")
 
 
+def decode_fields(fields, e):
+    out, pos = {}, 0
+    for name, code in fields:
+        fmt, n = CODES[code]
+        v = struct.unpack_from("<" + fmt, e, pos)[0]
+        if code == "fx32":
+            v /= 4096
+        elif code == "4cc":
+            v = fourcc(v)
+        elif code == "s16":
+            v = v.split(b"\0")[0].decode("cp932", "replace")
+        out[name] = v
+        pos += n
+    if pos < len(e):
+        out["rest"] = e[pos:].hex()
+    return out
+
+
 def decode_entry(tag, e, game=None, version=None):
     fields = schema_for(tag, len(e), game, version)
     out = {}
     if fields:
-        pos = 0
-        for name, code in fields:
-            fmt, n = CODES[code]
-            v = struct.unpack_from("<" + fmt, e, pos)[0]
-            if code == "fx32":
-                v /= 4096
-            elif code == "4cc":
-                v = fourcc(v)
-            elif code == "s16":
-                v = v.split(b"\0")[0].decode("latin-1")
-            out[name] = v
-            pos += n
-        if pos < len(e):
-            out["rest"] = e[pos:].hex()
-        return out
+        return decode_fields(fields, e)
     words = len(e) // 4
     for i, w in enumerate(struct.unpack_from(f"<{words}I", e)):
         out[f"w{i}"] = f"{w:08x}"
@@ -90,7 +96,7 @@ def decode_entry(tag, e, game=None, version=None):
     return out
 
 
-def section(tag, body, game=None, version=None):
+def section(tag, body, game=None, version=None, magic=None):
     """body = section bytes after the 8-byte tag/size header."""
     s = {"tag": tag, "size": len(body) + 8}
     if tag == "ROMB" and len(body) >= 4:
@@ -107,14 +113,78 @@ def section(tag, body, game=None, version=None):
     if len(body) < 4:
         s["raw"] = body.hex()
         return s
-    count, word = struct.unpack_from("<HH", body, 0)
-    s["count"], s["word"] = count, f"{word:04x}"
-    data = body[4:]
-    if count and len(data) % count == 0:
-        esz = len(data) // count
+    if tag == "GRDB" and magic == "MCLB":
+        # lookup grid: u16 cells along X, u16 cells along Z, then one record per cell,
+        # x-major (for x: for z:), each u16 n + n u16 TRIB indices, padded to 4 bytes
+        w, h = struct.unpack_from("<HH", body, 0)
+        s.update(cells_x=w, cells_z=h, order="x-major: cells[x][z] = triangle indices")
+        cells, pos = [], 4
+        try:
+            for _ in range(w):
+                col = []
+                for _ in range(h):
+                    n = struct.unpack_from("<H", body, pos)[0]
+                    col.append(list(struct.unpack_from(f"<{n}H", body, pos + 2)))
+                    pos += (2 + 2 * n + 3) & ~3
+                cells.append(col)
+            s["cells"] = cells
+            if body[pos:].strip(b"\0"):
+                s["trailing"] = body[pos:].hex()
+        except struct.error:
+            s["raw"] = body[4:].hex()
+        return s
+    if tag == "RALB" and game in ("ph", "st") and len(body) >= 4:
+        # rails: count, word, then per rail a header and its points (ST points are
+        # variable: 0x18 bytes + {rail, point} junction pairs, size in the point itself)
+        count, word = struct.unpack_from("<HH", body, 0)
+        s.update(count=count, word=f"{word:04x}", rails=[])
+        rk = next(k for k in SCHEMA if k.startswith(f"{game}:RALB.rail/"))
+        pk = next(k for k in SCHEMA if k.startswith(f"{game}:RALB.point/"))
+        rsz, psz = int(rk.split("/")[1]), int(pk.split("/")[1])
+        pos = 4
+        try:
+            for _ in range(count):
+                rail = decode_fields(SCHEMA[rk], body[pos:pos + rsz])
+                pos += rsz
+                pts = []
+                for _ in range(rail["num_points"]):
+                    pt = decode_fields(SCHEMA[pk], body[pos:pos + psz])
+                    step = pt.get("point_size", psz)
+                    if "link_count" in pt:
+                        pt["links"] = [list(body[pos + psz + 2 * i:pos + psz + 2 * i + 2]) for i in range(pt["link_count"])]
+                    pts.append(pt)
+                    pos += step
+                rail["points"] = pts
+                s["rails"].append(rail)
+            if body[pos:].strip(b"\0"):
+                s["trailing"] = body[pos:].hex()
+        except (struct.error, KeyError):
+            s.pop("rails")
+            s["raw"] = body[4:].hex()
+        return s
+    hdr = next(((int(k.split("/")[1]), v) for k, v in SCHEMA.items()
+                if k.split(":")[-1].startswith(f"{tag}.HDR/")), None)
+    if hdr:
+        # section with its own header; its "count" field gives the number of entries
+        hsize, fields = hdr
+        s["header"] = decode_fields(fields, body[:hsize])
+        count, data = s["header"].get("count", 0), body[hsize:]
+    else:
+        count, word = struct.unpack_from("<HH", body, 0)
+        s["count"], s["word"] = count, f"{word:04x}"
+        data = body[4:]
+    sizes = sorted({int(k.split("/")[1].split("@")[0]) for k in SCHEMA
+                    if k.split(":")[-1].split("/")[0] == tag})
+    esz = len(data) // count if count and len(data) % count == 0 else None
+    if count and esz not in sizes:
+        # known entry size followed by padding (e.g. NRMB)
+        esz = next((z for z in sizes if count * z <= len(data) < count * z + 4), esz)
+    if count and esz:
         s["entry_size"] = esz
         s["entries"] = [decode_entry(tag, data[i * esz:(i + 1) * esz], game, version) for i in range(count)]
-    elif count == 0 and not data:
+        if data[count * esz:].strip(b"\0"):
+            s["trailing"] = data[count * esz:].hex()
+    elif count == 0 and not data.strip(b"\0"):
         s["entries"] = []
     else:
         s["raw"] = data.hex()
@@ -128,9 +198,36 @@ def parse(d, game=None):
         size, n = struct.unpack_from("<II", d, 8)
         out = {"magic": fourcc(head), "version": fourcc(d[4:8]), "sections": []}
         pos = 0x20
-    elif head == b"ZCAB":
+    elif head in (b"ZCLB", b"ZCIB"):
+        # course lists: u32 size, u32 count, u32 count, then size-prefixed records
         size, n = struct.unpack_from("<II", d, 4)
-        out = {"magic": "ZCAB", "sections": []}
+        out, pos = {"magic": head.decode(), "records": []}, 0x10
+        for _ in range(n):
+            rsz = struct.unpack_from("<I", d, pos)[0]
+            rec = d[pos + 4:pos + rsz]
+            fixed = next(((int(k.split("/")[1]), v) for k, v in SCHEMA.items()
+                          if k in (f"{game}:{head.decode()}/{len(rec)}",) or
+                          (k.startswith(f"{game}:{head.decode()}/") and "." not in k)), None) if game else None
+            r = {"size": rsz}
+            if fixed and fixed[0] <= len(rec):
+                r.update(decode_fields(fixed[1], rec[:fixed[0]]))
+                r.pop("rest", None)
+                rk = [k for k in SCHEMA if k.startswith(f"{game}:{head.decode()}.ROOM/")]
+                tail = rec[fixed[0]:]
+                if rk and "nrooms" in r:
+                    rs = int(rk[0].split("/")[1])
+                    r["rooms"] = [decode_fields(SCHEMA[rk[0]], tail[i * rs:(i + 1) * rs]) for i in range(r["nrooms"])]
+                    tail = tail[r["nrooms"] * rs:]
+                if tail:
+                    r["rest"] = tail.hex()
+            else:
+                r["raw"] = rec.hex()
+            out["records"].append(r)
+            pos += rsz
+        return out
+    elif head in (b"ZCAB", b"ZILB"):
+        size, n = struct.unpack_from("<II", d, 4)
+        out = {"magic": head.decode(), "sections": []}
         pos = 0x10
     elif head == b"ZOLB":
         size, a, b, count, word = struct.unpack_from("<IHHHH", d, 4)
@@ -138,13 +235,15 @@ def parse(d, game=None):
         # npctype lists are actor FourCCs, motype lists numeric object types
         names = [fourcc(body[i:i + 4]) for i in range(0, count * 4, 4)]
         is_4cc = all(len(x) == 4 and all(c.isalnum() or c == "_" for c in x) for x in names) and count
-        return {"magic": "ZOLB", "h0": a, "h1": b, "word": f"{word:04x}",
+        # h0: allocation pool size in units (PH actors 0x80 bytes, PH objects 0x40; ST 0x100 / 0x80)
+        # h1: instance table capacity. Lists are preload/sizing only: they never spawn anything.
+        return {"magic": "ZOLB", "pool_units": a, "instances": b, "word": f"{word:04x}",
                 "entries": names if is_4cc else list(struct.unpack_from(f"<{count}I", body))}
     else:
         raise ValueError(f"unknown container {head!r}")
     for _ in range(n):
         tag, ssz = fourcc(d[pos:pos + 4]), struct.unpack_from("<I", d, pos + 4)[0]
-        out["sections"].append(section(tag, d[pos + 8:pos + ssz], game, out.get("version")))
+        out["sections"].append(section(tag, d[pos + 8:pos + ssz], game, out.get("version"), out["magic"]))
         if ssz < 8:
             break
         pos += ssz
