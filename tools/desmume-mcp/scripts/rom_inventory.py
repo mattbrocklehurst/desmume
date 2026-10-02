@@ -106,8 +106,35 @@ def classify(data):
     return None, None, comp, data
 
 
+def fnt_names(d, base, limit):
+    """{file_index: path} from a DS-style file name table at d[base:limit]."""
+    names = {}
+
+    def walk(dir_id, prefix, depth=0):
+        if depth > 16:
+            return
+        entry = base + (dir_id & 0xFFF) * 8
+        sub_off, first = struct.unpack_from("<IH", d, entry)
+        pos, fid = base + sub_off, first
+        while pos < limit:
+            n = d[pos]; pos += 1
+            if n == 0:
+                break
+            name = d[pos:pos + (n & 0x7F)].decode("latin-1"); pos += n & 0x7F
+            if n & 0x80:
+                sub = struct.unpack_from("<H", d, pos)[0]; pos += 2
+                walk(sub, prefix + name + "/", depth + 1)
+            else:
+                names[fid] = prefix + name; fid += 1
+    try:
+        walk(0xF000, "")
+    except (struct.error, IndexError):
+        pass
+    return names
+
+
 def narc_members(d):
-    """[(name_or_index, bytes)] for a NARC archive."""
+    """[(name_or_index, bytes)] for a NARC archive (names from its BTNF table when present)."""
     try:
         hdr = struct.unpack_from("<HH", d, 12)[0]
         pos = hdr
@@ -117,11 +144,13 @@ def narc_members(d):
         entries = [struct.unpack_from("<II", d, pos + 12 + k * 8) for k in range(count)]
         pos += fatb_size
         assert d[pos:pos + 4] == b"BTNF"
-        pos += struct.unpack_from("<I", d, pos + 4)[0]
+        fntb_size = struct.unpack_from("<I", d, pos + 4)[0]
+        names = fnt_names(d, pos + 8, pos + fntb_size)
+        pos += fntb_size
         assert d[pos:pos + 4] == b"GMIF"
         img = pos + 8
         for k, (s, e) in enumerate(entries):
-            out.append((k, d[img + s:img + e]))
+            out.append((names.get(k, k), d[img + s:img + e]))
         return out
     except (AssertionError, struct.error):
         return []
@@ -145,6 +174,7 @@ def main():
 
     files, by_fmt = [], collections.defaultdict(lambda: {"files": 0, "bytes": 0, "in_archives": 0, "dirs": collections.Counter()})
     ext_unknown = collections.Counter()
+    magics = collections.Counter()           # (extension, first 4 bytes) of unrecognised archive members
     for fid, path in sorted(rom.files.items(), key=lambda x: x[1]):
         data = rom.file_data(fid)
         fmt, desc, comp, plain = classify(data)
@@ -160,10 +190,13 @@ def main():
         if fmt == "NARC":
             members = collections.Counter()
             for k, md in narc_members(plain):
-                mf, _, mc, _ = classify(md)
-                mk = mf or "unknown"
+                mf, _, mc, mplain = classify(md)
+                ext = k.rsplit(".", 1)[-1].lower() if isinstance(k, str) and "." in k else ""
+                mk = mf or (f"unknown .{ext}" if ext else "unknown")
                 members[mk + (" (LZ77)" if mc else "")] += 1
-                by_fmt[mf or "unknown (in NARC)"]["in_archives"] += 1
+                by_fmt[mf or f"unknown .{ext} (in NARC)"]["in_archives"] += 1
+                if mf is None:
+                    magics[(ext, mplain[:4])] += 1
             entry["members"] = dict(members)
         files.append(entry)
 
@@ -176,6 +209,11 @@ def main():
     for k, v in sorted(by_fmt.items(), key=lambda x: -x[1]["bytes"]):
         L.append(f"| {k} | {desc.get(k, '')} | {v['files']} | {v['bytes']:,} | {v['in_archives']} | "
                  + ", ".join(f"{d} ({n})" for d, n in v["dirs"].most_common(5)) + " |")
+    L += ["", "## Unrecognised formats inside archives (extension, first bytes)", "",
+          "| extension | first 4 bytes | as text | count |", "|---|---|---|---|"]
+    for (ext, mg), n in magics.most_common(40):
+        txt = "".join(chr(c) if 32 <= c < 127 else "." for c in mg)
+        L.append(f"| .{ext} | {mg.hex()} | `{txt}` | {n} |")
     L += ["", "## Directory tree (file counts)", ""]
     dirs = collections.Counter("/".join(f["path"].split("/")[:-1]) or "(root)" for f in files)
     L += [f"- `{d}`: {n}" for d, n in sorted(dirs.items())]
