@@ -86,6 +86,7 @@
 #include "../GPU.h"
 #include "../saves.h"
 #include "../movie.h"
+#include "../SPU.h"
 #include "../debug_hooks.h"
 #include <deque>
 #include <map>
@@ -864,6 +865,18 @@ std::string handle(int client_fd, const std::string &cmd, const Args &args, bool
 		if (path.empty()) return error_reply("missing path");
 		if (!MMU_new.backupDevice.exportData(path.c_str())) return error_reply("exporting the save failed");
 		return Json().boolean("ok", true).str("path", path).done();
+	}
+
+	if (cmd == "wav_begin") {
+		std::string path = arg_str(args, "path");
+		if (path.empty()) return error_reply("missing path");
+		if (!WAV_Begin(path.c_str(), WAVMODE_CORE)) return error_reply("cannot open " + path);
+		return Json().boolean("ok", true).str("path", path).done();
+	}
+
+	if (cmd == "wav_end") {
+		WAV_End();
+		return Json().boolean("ok", true).done();
 	}
 
 	if (cmd == "quit") {

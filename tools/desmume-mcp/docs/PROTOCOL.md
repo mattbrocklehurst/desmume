@@ -59,6 +59,8 @@ merged with the keyboard/joystick in the window.
 | `video_record path=F.mp4` / `video_stop` | via `ffmpeg` in PATH |
 | `backup_import path=FILE [size=N]` | load a battery save (raw `.sav`, no$gba or `.dsv`) into the cartridge backup memory and reset, so the game boots with it (no need to place files in DeSmuME's battery folder) |
 | `backup_export path=FILE` | write the current backup memory to a file (raw) |
+| `wav_begin path=FILE` | start recording the emulated sound output (the core mixer, before any host audio) to a 16-bit stereo WAV |
+| `wav_end` | stop the recording and close the file |
 | `dump dir=DIR [note=TEXT]` | freeze: pause and write RAM/VRAM/IO/registers/screenshot/savestate + `manifest.json` |
 
 ## Event hooks
